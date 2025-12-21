@@ -1,0 +1,8 @@
+dotenv
+azure-ai-agents
+azure-core
+azure-identity
+azure-monitor-query==1.4.1
+pandas 
+numpy 
+matplotlib

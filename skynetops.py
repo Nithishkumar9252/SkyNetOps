@@ -2,157 +2,107 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkynetOps — Hybrid Monitoring (Azure VM via SSH)
-- Data source: Direct-from-VM (Linux) over SSH (CPU, Memory, Disk capacity, Disk I/O)
-- Severity levels (P1/P2/P3), dynamic subjects, CID logo, dark-mode email, inline charts (base64)
-- Top-5 Processes (CPU / Memory / Disk I/O) direct from VM — all in table form (summary style)
-- Docker containers summary (if Docker CLI available on VM) + Top 5 containers by CPU and Memory
-- Cloud AI Analysis via Azure AI Agents (optional but attempted)
-- CSV attachments retained for alert details / top processes / docker summary
+SkynetOps — VM Health + Disk Analytics + Email Alerts + AI Analysis
+(Updated: CPU Load Average in email description, Light theme email)
 """
 
-# ---------------- Stdlib imports ----------------
 import os
 import sys
 import time
 import csv
-import json
-import base64
 import smtplib
-import html
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
-from email.mime.image import MIMEImage
-import mimetypes
 
-# ---------------- Third-party env loader ----------------
 from dotenv import load_dotenv
 
-# ---------------- Charts ----------------
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# Azure AI Agent models (optional)
+from azure.ai.agents.models import MessageTextContent, MessageRole  # for AI message parsing
 
-# ---------------- Data & analytics ----------------
+# data & analytics
 try:
     import pandas as pd
     import numpy as np
+    import matplotlib.pyplot as plt
 except Exception:
-    print("Missing packages (pandas, numpy, matplotlib). Install: pip install pandas numpy matplotlib paramiko python-dotenv azure-identity azure-ai-agents")
+    print("Missing packages (pandas, numpy, matplotlib). Install them: pip install pandas numpy matplotlib")
     raise
 
-# ---------------- SSH (remote Azure VM) ----------------
-try:
-    import paramiko
-    PARAMIKO_AVAILABLE = True
-except Exception:
-    PARAMIKO_AVAILABLE = False
-    print("⚠️ paramiko not available. Install: pip install paramiko")
+# Azure SDK
+from azure.identity import DefaultAzureCredential
+from azure.monitor.query import MetricsQueryClient, MetricAggregationType
+from azure.ai.agents import AgentsClient
+from azure.ai.agents.models import (
+    MessageRole,
+    MessageTextContent,
+)
 
-# ---------------- Azure AI (optional) ----------------
-try:
-    from azure.identity import DefaultAzureCredential
-    from azure.ai.agents import AgentsClient
-    from azure.ai.agents.models import MessageTextContent, MessageRole
-    AZURE_AI_AVAILABLE = True
-except Exception:
-    AZURE_AI_AVAILABLE = False
-    print("⚠️ Azure AI SDK not available. To enable AI: pip install azure-identity azure-ai-agents")
-
-# ---------------- Email attachments handling ----------------
+# email attachments handling
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
+from email.mime.image import MIMEImage  # For CID inline images
 
-# ---------------- ENV/CONFIG ----------------
 load_dotenv()
-os.environ["PYTHONIOENCODING"] = "utf-8"
 
-# Azure AI
+# ---------------- CONFIG ----------------
 PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
 MODEL_DEPLOYMENT = os.getenv("MODEL_DEPLOYMENT_NAME")
-AI_DEADLINE_SEC = float(os.getenv("AI_DEADLINE_SEC", 20.0))
-AI_POLL_EVERY_SEC = float(os.getenv("AI_POLL_EVERY_SEC", 0.7))
-USE_API_KEY = os.getenv("USE_API_KEY", "false").lower() in ("1", "true", "yes")
-AZURE_API_KEY = os.getenv("AZURE_API_KEY")
 
-# SSH to Azure VM
-VM_HOST = os.getenv("VM_HOST")
-VM_PORT = int(os.getenv("VM_PORT", 22))
-VM_USER = os.getenv("VM_USER")
-SSH_KEY_PATH = os.getenv("SSH_KEY_PATH")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD")
+SUBSCRIPTION_ID = os.getenv("SUBSCRIPTION_ID")
+RESOURCE_GROUP = os.getenv("RESOURCE_GROUP")
+VM_NAME = os.getenv("VM_NAME")
 
-# Output
-OUTPUT_DIR = Path("outputs_skynetops_ssh")
+OUTPUT_DIR = Path("outputs_advanced")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Email config
+# Email config (from .env)
 EMAIL_TO = os.getenv("EMAIL_ALERT_TO")
 EMAIL_FROM = os.getenv("EMAIL_ALERT_FROM")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.office365.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SMTP_USER = os.getenv("SMTP_USERNAME")
 SMTP_PASS = os.getenv("SMTP_PASSWORD")
+COMPANY_LOGO_PATH = os.getenv("COMPANY_LOGO_PATH")
 
-# Threshold defaults (can be overridden by user at runtime)
-CPU_THRESHOLD_DEFAULT = float(os.getenv("CPU_THRESHOLD", 80.0))
-DISK_THRESHOLD_DEFAULT = float(os.getenv("DISK_THRESHOLD", 85.0))  # % capacity used
-MEMORY_THRESHOLD_DEFAULT = float(os.getenv("MEMORY_THRESHOLD", 85.0))  # % used
+# thresholds
+CPU_THRESHOLD = float(os.getenv("CPU_THRESHOLD", 0.1))  # percentage
+MEM_FREE_PCT_THRESHOLD = float(os.getenv("MEM_FREE_PCT_THRESHOLD", 20.0))  # % free mem threshold
+DISK_THRESHOLD = float(os.getenv("DISK_THRESHOLD", 0.0))  # optional if you compute Disk %
+MEMORY_THRESHOLD = float(os.getenv("MEMORY_THRESHOLD", 0.0))  # % usage threshold
 
-# Sampling settings
-FAST_SAMPLES = int(os.getenv("FAST_SAMPLES", 5))     # micro-series length
-SAMPLE_SEC   = float(os.getenv("SAMPLE_SEC", 0.2))   # per sample spacing
-FAST_LOOKBACK_MIN = int(os.getenv("FAST_LOOKBACK_MIN", 5))  # for label only
+# severity margins (absolute points above threshold)
+SEVERITY_MARGIN_P1 = float(os.getenv("SEVERITY_MARGIN_P1", 20))
+SEVERITY_MARGIN_P2 = float(os.getenv("SEVERITY_MARGIN_P2", 10))
+SEVERITY_MARGIN_P3 = float(os.getenv("SEVERITY_MARGIN_P3", 0))
 
-# Emoji control
-USE_EMOJI = os.getenv("USE_EMOJI", "1") == "1"
+FAST_LOOKBACK_MIN = int(os.getenv("FAST_LOOKBACK_MIN", 5))
+ALERT_CSV_LOOKBACK_MIN = int(os.getenv("ALERT_CSV_LOOKBACK_MIN", 60))
 
-# Branding & behavior
-COMPANY_LOGO_PATH = os.getenv("COMPANY_LOGO_PATH")  # e.g., assets/EY-Logo-web.png or absolute path
-INLINE_CHARTS = os.getenv("INLINE_CHARTS", "1") == "1"
+TOTAL_MEMORY_BYTES = int(os.getenv("TOTAL_MEMORY_BYTES") or 0)
 
-# Disk mount path (Linux VM)
-MOUNT_PATH = os.getenv("MOUNT_PATH", "/")
+USE_EMOJI = str(os.getenv("USE_EMOJI", "1")).strip() in ("1", "true", "yes")
+INLINE_CHARTS = str(os.getenv("INLINE_CHARTS", "0")).strip() in ("1", "true", "yes")
 
-# Severity margins
-SEVERITY_MARGIN_P1 = int(os.getenv("SEVERITY_MARGIN_P1", 20))
-SEVERITY_MARGIN_P2 = int(os.getenv("SEVERITY_MARGIN_P2", 10))
-SEVERITY_MARGIN_P3 = int(os.getenv("SEVERITY_MARGIN_P3", 0))
+# credential
+_credential = DefaultAzureCredential(exclude_cli_credential=False)
 
-# ---------------- Console safety ----------------
-def _init_console_encoding() -> None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-_init_console_encoding()
+# ---------------- SSH CONFIG ----------------
+VM_SSH_HOST = os.getenv("VM_SSH_HOST")
+VM_SSH_PORT = int(os.getenv("VM_SSH_PORT", 22))
+VM_SSH_USERNAME = os.getenv("VM_SSH_USERNAME")
+VM_SSH_PASSWORD = os.getenv("VM_SSH_PASSWORD")  # optional
+VM_SSH_KEY_PATH = os.getenv("VM_SSH_KEY_PATH")  # optional
+VM_SSH_USE_SUDO = str(os.getenv("VM_SSH_USE_SUDO", "false")).lower() in ("1", "true", "yes")
 
-def _icon(unicode_icon: str, fallback: str) -> str:
-    if not USE_EMOJI:
-        return fallback
-    try:
-        (sys.stdout.encoding or "utf-8")
-        unicode_icon.encode(sys.stdout.encoding or "utf-8", errors="strict")
-        return unicode_icon
-    except Exception:
-        return fallback
-
-ICONS = {
-    "gear": _icon("⚙️", "[Process]"),
-    "alert": _icon("🚨", "[Alert]"),
-    "ok": _icon("✅", "[OK]"),
-    "safe": _icon("✅", "[Safe]"),
-    "warning": _icon("⚠️", "[Warn]"),
-    "cpu": _icon("🧮", "[CPU]"),
-    "disk": _icon("💾", "[Disk]"),
-    "mem": _icon("🧠", "[Mem]"),
-}
+# Try paramiko import
+try:
+    import paramiko
+except Exception:
+    print("Missing package 'paramiko'. Install it: pip install paramiko")
+    paramiko = None
 
 # ---------------- Helpers ----------------
 def human_bytes(num: float, suffix: str = "B") -> str:
@@ -168,389 +118,108 @@ def human_bytes(num: float, suffix: str = "B") -> str:
         num /= 1024.0
     return f"{num:0.2f} P{suffix}"
 
-def utc_iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def resolve_logo_path(env_value: Optional[str]) -> Optional[Path]:
-    if not env_value:
-        return None
-
-    # Expand env vars & ~
-    env_value = os.path.expandvars(os.path.expanduser(env_value))
-
-    # Try absolute
-    p = Path(env_value)
-    if p.is_absolute() and p.exists():
-        return p
-
-    # Try relative to script file
-    script_dir = Path(__file__).resolve().parent
-    p2 = script_dir / env_value
-    if p2.exists():
-        return p2.resolve()
-
-    # Try current working dir
-    p3 = Path.cwd() / env_value
-    if p3.exists():
-        return p3.resolve()
-
-    return None
-
-
-# ---------------- Severity + Subject helpers ----------------
-def classify_severity(value: float, threshold: float) -> Optional[str]:
-    if value is None or threshold is None:
-        return None
-    diff = float(value) - float(threshold)
-    if diff < SEVERITY_MARGIN_P3:
-        return None
-    if diff >= SEVERITY_MARGIN_P1:
-        return "P1"
-    if diff >= SEVERITY_MARGIN_P2:
-        return "P2"
-    return "P3"
-
-def overall_severity(cpu_s: Optional[str], disk_s: Optional[str], mem_s: Optional[str]) -> Optional[str]:
-    order = {"P1": 3, "P2": 2, "P3": 1, None: 0}
-    return max([cpu_s, disk_s, mem_s], key=lambda s: order.get(s, 0)) or None
-
-def build_alert_subject(metrics: dict, cpu_thr: float, disk_thr: float, mem_thr: float) -> str:
-    cpu_s = classify_severity(metrics.get("cpu_percent"), cpu_thr)
-    disk_s = classify_severity(metrics.get("disk_percent"), disk_thr)
-    mem_s = classify_severity(metrics.get("memory_percent"), mem_thr)
-    overall = overall_severity(cpu_s, disk_s, mem_s) or "Info"
-
-    items = []
-    if cpu_s:
-        items.append(f"CPU {metrics['cpu_percent']:.1f}% ({cpu_s})")
-    if disk_s and metrics.get('disk_percent') is not None:
-        items.append(f"Disk {metrics['disk_percent']:.1f}% ({disk_s})")
-    if mem_s and metrics.get('memory_percent') is not None:
-        items.append(f"Memory {metrics['memory_percent']:.1f}% ({mem_s})")
-
-    prefix = f"🔴 [{overall}] " if (USE_EMOJI and overall != "Info") else f"[{overall}] "
-    if len(items) == 1:
-        subject = f"{prefix}SkynetOps Alert — {items[0]}"
-    elif len(items) > 1:
-        subject = f"{prefix}SkynetOps Alert — " + ", ".join(items)
-    else:
-        subject = f"{ICONS['ok']} SkynetOps — System Healthy" if USE_EMOJI else "SkynetOps — System Healthy"
-    return subject
-
-def file_to_base64_datauri(image_path: Optional[Path]) -> Optional[str]:
-    if not image_path:
-        return None
-    try:
-        with open(image_path, "rb") as fp:
-            b64 = base64.b64encode(fp.read()).decode("ascii")
-        ext = image_path.suffix.lower()
-        if ext in (".png", ""): mime = "image/png"
-        elif ext in (".jpg", ".jpeg"): mime = "image/jpeg"
-        elif ext == ".svg": mime = "image/svg+xml"
-        else: mime = "application/octet-stream"
-        return f"data:{mime};base64,{b64}"
-    except Exception:
-        return None
-
-# ---------------- SSH Session ----------------
-class SSHSession:
-    def __init__(self):
-        self.client: Optional[paramiko.SSHClient] = None
-
-    def __enter__(self):
-        if not PARAMIKO_AVAILABLE:
-            raise RuntimeError("paramiko not installed.")
-        if not VM_HOST or not VM_USER or (not SSH_KEY_PATH and not SSH_PASSWORD):
-            raise ValueError("REMOTE mode requires VM_HOST, VM_USER and SSH_KEY_PATH or SSH_PASSWORD")
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        if SSH_KEY_PATH and Path(SSH_KEY_PATH).exists():
-            pkey = None
-            try:
-                pkey = paramiko.RSAKey.from_private_key_file(SSH_KEY_PATH)
-            except Exception:
-                pkey = paramiko.Ed25519Key.from_private_key_file(SSH_KEY_PATH)
-            client.connect(VM_HOST, port=VM_PORT, username=VM_USER, pkey=pkey, timeout=20, allow_agent=True, look_for_keys=True)
-        else:
-            client.connect(VM_HOST, port=VM_PORT, username=VM_USER, password=SSH_PASSWORD, timeout=20, allow_agent=True, look_for_keys=True)
-        self.client = client
-        return self
-
-    def run(self, cmd: str) -> Tuple[str, str, int]:
-        assert self.client is not None
-        stdin, stdout, stderr = self.client.exec_command(cmd, timeout=25)
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        rc = stdout.channel.recv_exit_status()
-        return out, err, rc
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            if self.client:
-                self.client.close()
-        except Exception:
-            pass
-
-# ---------------- Remote Sampling ----------------
-def sample_cpu_remote(sess: SSHSession, step: float = SAMPLE_SEC) -> float:
-    out1, _, _ = sess.run("cat /proc/stat | head -n 1")
-    time.sleep(step)
-    out2, _, _ = sess.run("cat /proc/stat | head -n 1")
-    def parse(line: str) -> Tuple[int, int]:
-        parts = line.strip().split()
-        if not parts or parts[0] != "cpu":
-            return 0, 0
-        vals = list(map(int, parts[1:]))
-        idle = vals[3] + vals[4]  # idle + iowait
-        total = sum(vals)
-        return idle, total
-    i1, t1 = parse(out1); i2, t2 = parse(out2)
-    dt = t2 - t1; di = i2 - i1
-    return 0.0 if dt <= 0 else max(0.0, min(100.0, (1.0 - (di / dt)) * 100.0))
-
-def mem_used_pct_remote(sess: SSHSession) -> Optional[float]:
-    out, _, _ = sess.run("cat /proc/meminfo")
-    mt = ma = None
-    for line in out.splitlines():
-        if line.startswith("MemTotal:"):
-            mt = int(line.split()[1]) * 1024
-        if line.startswith("MemAvailable:"):
-            ma = int(line.split()[1]) * 1024
-    if mt and ma:
-        used_pct = (1.0 - (ma / mt)) * 100.0
-        return max(0.0, min(100.0, used_pct))
-    return None
-
-def disk_capacity_used_remote(sess: SSHSession, mount: str = MOUNT_PATH) -> Optional[float]:
-    mount = mount if mount.startswith("/") else "/"
-    out, _, rc = sess.run(f"df -P {mount} | tail -n 1 | awk '{{print $5}}'")
-    if rc == 0 and out.strip():
-        try:
-            val = float(out.strip().replace('%', '').strip())
-            return max(0.0, min(100.0, val))
-        except Exception:
-            return None
-    return None
-
-def disk_bps_remote(sess: SSHSession, step: float = SAMPLE_SEC) -> Tuple[float, float]:
-    out1, _, _ = sess.run("cat /proc/diskstats"); t1 = time.time()
-    time.sleep(step)
-    out2, _, _ = sess.run("cat /proc/diskstats"); t2 = time.time()
-    def rdwr(out: str) -> Tuple[int, int]:
-        r = w = 0
-        for ln in out.splitlines():
-            p = ln.split()
-            if len(p) >= 14:
-                try:
-                    r += int(p[5]) * 512
-                    w += int(p[9]) * 512
-                except Exception:
-                    pass
-        return r, w
-    r1, w1 = rdwr(out1); r2, w2 = rdwr(out2)
-    dt = max(0.001, t2 - t1)
-    return max(0.0, (r2 - r1) / dt), max(0.0, (w2 - w1) / dt)
-
-def top5_cpu_remote(sess: SSHSession) -> List[Dict[str, Any]]:
-    out, _, _ = sess.run(r"ps -eo pid,user,pcpu,pmem,rss,comm --sort=-pcpu | head -n 6")
-    rows = []
-    for line in out.strip().splitlines()[1:]:
-        parts = line.split(None, 6)
-        if len(parts) >= 6:
-            pid, user, pcpu, pmem, rss, comm = parts[:6]
-            rows.append({"Computer": VM_HOST or "VM", "PID": int(pid), "Process": comm, "User": user, "CPUPercent": float(pcpu), "RSSBytes": int(rss) * 1024})
-    return rows[:5]
-
-def top5_memory_remote(sess: SSHSession) -> List[Dict[str, Any]]:
-    out, _, _ = sess.run(r"ps -eo pid,user,pcpu,pmem,rss,comm --sort=-rss | head -n 6")
-    rows = []
-    for line in out.strip().splitlines()[1:]:
-        parts = line.split(None, 6)
-        if len(parts) >= 6:
-            pid, user, pcpu, pmem, rss, comm = parts[:6]
-            rows.append({"Computer": VM_HOST or "VM", "PID": int(pid), "Process": comm, "User": user, "CPUPercent": float(pcpu), "RSSBytes": int(rss) * 1024})
-    return rows[:5]
-
-def top5_disk_remote(sess: SSHSession, step: float = SAMPLE_SEC) -> List[Dict[str, Any]]:
-    out, _, _ = sess.run(r"ps -eo pid --sort=-pcpu | head -n 31")
-    pids = [int(x.strip()) for x in out.strip().splitlines()[1:] if x.strip().isdigit()]
-    def read_io(pid: int) -> Tuple[int, int]:
-        o, _, _ = sess.run(f"cat /proc/{pid}/io 2>/dev/null || true")
-        rb = wb = 0
-        for ln in o.splitlines():
-            if ln.startswith("read_bytes:"):
-                rb = int(ln.split()[1])
-            if ln.startswith("write_bytes:"):
-                wb = int(ln.split()[1])
-        return rb, wb
-    io1 = {pid: read_io(pid) for pid in pids}
-    time.sleep(step)
-    rows = []
-    for pid in pids:
-        rb2, wb2 = read_io(pid); rb1, wb1 = io1.get(pid, (rb2, wb2))
-        rows.append({"Computer": VM_HOST or "VM", "PID": pid, "Process": "", "ReadBps": max(0.0, (rb2 - rb1) / step), "WriteBps": max(0.0, (wb2 - wb1) / step)})
-    if pids:
-        ps_o, _, _ = sess.run("ps -o pid,comm -p " + ",".join(map(str, pids)))
-        names = {}
-        for ln in ps_o.splitlines()[1:]:
-            parts = ln.strip().split(None, 1)
-            if len(parts) == 2 and parts[0].isdigit():
-                names[int(parts[0])] = parts[1]
-        for r in rows:
-            r["Process"] = names.get(r["PID"], str(r["PID"]))
-    rows.sort(key=lambda x: x.get("ReadBps", 0.0) + x.get("WriteBps", 0.0), reverse=True)
-    for r in rows:
-        r["TotalBps"] = r["ReadBps"] + r["WriteBps"]
-    return rows[:5]
-
-# ---------------- Docker helpers (REMOTE via CLI) ----------------
-def docker_available_remote(sess: SSHSession) -> bool:
-    out, _, rc = sess.run("command -v docker >/dev/null 2>&1 && echo OK || echo NO")
-    return (rc == 0 and "OK" in out)
-
-def _pct_to_float(s: str) -> float:
-    try:
-        return float(str(s).strip().replace("%", ""))
-    except Exception:
-        return 0.0
-
-def _parse_mem_usage(s: str) -> Tuple[float, float]:
-    """
-    Parse strings like '10.24MiB / 1GiB' into (used_bytes, limit_bytes).
-    """
-    try:
-        parts = [p.strip() for p in s.split("/")]
-        used = parts[0]; limit = parts[1]
-        def to_bytes(x: str) -> float:
-            m = re.match(r"([0-9]*\.?[0-9]+)\s*([KMGTP]?i?B)", x, re.I)
-            if not m:
-                return float(x) if x.replace(".", "", 1).isdigit() else 0.0
-            val = float(m.group(1)); unit = m.group(2).lower()
-            mult = {"b":1, "kib":1024, "kb":1000, "mib":1024**2, "mb":1000**2,
-                    "gib":1024**3, "gb":1000**3, "tib":1024**4, "tb":1000**4,
-                    "pib":1024**5, "pb":1000**5}.get(unit,1)
-            return val * mult
-        return to_bytes(used), to_bytes(limit)
-    except Exception:
-        return 0.0, 0.0
-
-def docker_summary_remote(sess: SSHSession) -> List[Dict[str, Any]]:
-    if not docker_available_remote(sess):
-        return []
-    fmt_ps = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
-    out_ps, _, _ = sess.run(f"docker ps --format '{fmt_ps}'")
-    ps_rows = {}
-    for ln in out_ps.strip().splitlines():
-        parts = ln.split("\t")
-        if len(parts) >= 4:
-            cid, name, img, status = parts[:4]
-            ps_rows[cid] = {"ID": cid, "Name": name, "Image": img, "Status": status}
-
-    fmt_st = "{{.Container}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}"
-    out_st, _, _ = sess.run(f"docker stats --no-stream --format '{fmt_st}'")
-    rows: List[Dict[str, Any]] = []
-    for ln in out_st.strip().splitlines():
-        parts = ln.split("\t")
-        if len(parts) >= 7:
-            cid, name, cpu_s, mem_usage, mem_pct_s, net_io, block_io = parts[:7]
-            used_b, lim_b = _parse_mem_usage(mem_usage)
-            row = {
-                "ID": cid, "Name": name, "Image": ps_rows.get(cid, {}).get("Image", ""),
-                "Status": ps_rows.get(cid, {}).get("Status", ""),
-                "CPUPercent": _pct_to_float(cpu_s),
-                "MemPercent": _pct_to_float(mem_pct_s),
-                "MemUsageBytes": used_b, "MemLimitBytes": lim_b,
-                "NetIO": net_io, "BlockIO": block_io
-            }
-            rows.append(row)
-    if not rows and ps_rows:
-        rows = [{"ID": cid, **ps_rows[cid],
-                 "CPUPercent": 0.0, "MemPercent": 0.0,
-                 "MemUsageBytes": 0.0, "MemLimitBytes": 0.0, "NetIO":"", "BlockIO":""}
-                for cid in ps_rows.keys()]
-    return rows
-
-def render_docker_html(rows: List[Dict[str, Any]]) -> str:
-    if not rows:
-        return "<h3>Docker Summary</h3><p>No Docker data (CLI unavailable or daemon not running).</p>"
-
-    def row_html(r: Dict[str, Any]) -> str:
-        return (
-            "<tr>"
-            f"<td>{html.escape(r.get('ID',''))}</td>"
-            f"<td>{html.escape(r.get('Name',''))}</td>"
-            f"<td>{html.escape(r.get('Image',''))}</td>"
-            f"<td>{html.escape(r.get('Status',''))}</td>"
-            f"<td style='text-align:right'>{float(r.get('CPUPercent',0.0)):.2f}%</td>"
-            f"<td style='text-align:right'>{float(r.get('MemPercent',0.0)):.2f}%</td>"
-            f"<td style='text-align:right'>{human_bytes(float(r.get('MemUsageBytes',0.0)))}</td>"
-            f"<td>{html.escape(r.get('NetIO',''))}</td>"
-            f"<td>{html.escape(r.get('BlockIO',''))}</td>"
-            "</tr>"
-        )
-
-    # Top 5 by CPU and Memory
-    top_cpu = sorted(rows, key=lambda r: float(r.get("CPUPercent",0.0)), reverse=True)[:5]
-    top_mem = sorted(rows, key=lambda r: float(r.get("MemUsageBytes",0.0)), reverse=True)[:5]
-
-    def simple_list_html(title: str, data: List[Dict[str,Any]], cols: List[str]) -> str:
-        header = "<tr>" + "".join([f"<th>{c}</th>" for c in cols]) + "</tr>"
-        body = ""
-        for r in data:
-            cells = []
-            for c in cols:
-                v = r.get(c)
-                if c == "CPUPercent":
-                    v = f"{float(v or 0.0):.2f}%"
-                elif c == "MemUsageBytes":
-                    v = human_bytes(float(v or 0.0))
-                cells.append(f"<td>{html.escape(str(v)) if v is not None else ''}</td>")
-            body += "<tr>" + "".join(cells) + "</tr>"
-        return (
-            f"<h4>{title}</h4>"
-            "<table class='summary' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
-            f"<thead>{header}</thead><tbody>{body or '<tr><td colspan=99>No data</td></tr>'}</tbody></table>"
-        )
-
-    full_table = (
-        "<h3>Docker Summary</h3>"
-        "<table class='summary' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
-        "<thead><tr>"
-        "<th>ID</th><th>Name</th><th>Image</th><th>Status</th>"
-        "<th>CPU %</th><th>Mem %</th><th>Mem Used</th><th>Net I/O</th><th>Block I/O</th>"
-        "</tr></thead>"
-        "<tbody>"
-        + "".join([row_html(r) for r in rows])
-        + "</tbody></table>"
+def html_escape(s: str) -> str:
+    if s is None:
+        return ""
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&#39;")
     )
 
-    top_cpu_table = simple_list_html("Top 5 Containers — CPU", top_cpu, ["Name","ID","Image","CPUPercent"])
-    top_mem_table = simple_list_html("Top 5 Containers — Memory", top_mem, ["Name","ID","Image","MemUsageBytes"])
-    return full_table + top_cpu_table + top_mem_table
+def build_metrics_client() -> MetricsQueryClient:
+    return MetricsQueryClient(_credential)
 
-def save_docker_csv(rows: List[Dict[str,Any]]) -> Optional[Path]:
-    if not rows:
-        return None
-    p = OUTPUT_DIR / f"docker_summary_{int(time.time())}.csv"
-    with open(p, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["ID","Name","Image","Status","CPUPercent","MemPercent","MemUsageBytes","MemLimitBytes","NetIO","BlockIO"])
-        for r in rows:
-            w.writerow([
-                r.get("ID",""), r.get("Name",""), r.get("Image",""), r.get("Status",""),
-                r.get("CPUPercent",0.0), r.get("MemPercent",0.0),
-                r.get("MemUsageBytes",0.0), r.get("MemLimitBytes",0.0),
-                r.get("NetIO",""), r.get("BlockIO","")
-            ])
-    return p
+def build_agents_client() -> AgentsClient:
+    if not PROJECT_ENDPOINT:
+        raise ValueError("PROJECT_ENDPOINT is required for agent features")
+    return AgentsClient(endpoint=PROJECT_ENDPOINT, credential=_credential)
 
-# ---------------- Dataframe utilities ----------------
+# ---------------- Metrics fetching ----------------
+def query_recent_metrics(minutes_back: int) -> List[List]:
+    if not all([SUBSCRIPTION_ID, RESOURCE_GROUP, VM_NAME]):
+        raise ValueError("Azure subscription/resource/VM not configured in .env")
+
+    client = build_metrics_client()
+    vm_res = f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/providers/Microsoft.Compute/virtualMachines/{VM_NAME}"
+
+    metric_names = [
+        "Percentage CPU",
+        "Available Memory Bytes",
+        "Disk Read Bytes",
+        "Disk Write Bytes",
+    ]
+
+    kwargs = dict(
+        metric_names=metric_names,
+        timespan=timedelta(minutes=minutes_back),
+        granularity=timedelta(minutes=1),
+        aggregations=[MetricAggregationType.AVERAGE],
+    )
+
+    try:
+        resp = client.query_resource(resource_uri=vm_res, **kwargs)
+    except TypeError:
+        resp = client.query_resource(resource_id=vm_res, **kwargs)
+
+    rows = []
+    for metric in getattr(resp, "metrics", []):
+        name_obj = getattr(metric, "name", metric)
+        name_label = getattr(name_obj, "value", name_obj)
+        for ts in getattr(metric, "timeseries", []):
+            for point in getattr(ts, "data", []):
+                ts_time = getattr(point, "timestamp", None) or getattr(point, "time_stamp", None)
+                ts_iso = ts_time.isoformat() if ts_time else datetime.utcnow().isoformat()
+                val = getattr(point, "average", None) or 0
+                rows.append([ts_iso, name_label, float(val)])
+    return rows
+
+# ---------------- Dataframe ----------------
 def rows_to_df(rows: List[List]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["timestamp", "metric", "value"])
     df = pd.DataFrame(rows, columns=["timestamp", "metric", "value"])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df
+
+# ---------------- Analytics ----------------
+def compute_summary_stats(df: pd.DataFrame, metric_name: str, drop_zeros: bool = False) -> dict:
+    s = df.loc[df["metric"] == metric_name, "value"].astype(float)
+    if drop_zeros:
+        s = s.replace(0.0, np.nan)
+    s = s.dropna()
+    if s.empty:
+        return {"min": None, "max": None, "avg": None, "median": None, "std": None}
+    return {
+        "min": float(s.min()),
+        "max": float(s.max()),
+        "avg": float(s.mean()),
+        "median": float(s.median()),
+        "std": float(s.std()),
+    }
+
+def moving_average(series: pd.Series, window: int = 5) -> pd.Series:
+    return series.rolling(window=window, min_periods=1).mean()
+
+def detect_anomalies_zscore(series: pd.Series, thresh: float = 2.5) -> pd.Series:
+    if series.empty:
+        return pd.Series(dtype=bool)
+    mu = series.mean()
+    sigma = series.std(ddof=0) if series.std(ddof=0) != 0 else 1.0
+    z = (series - mu) / sigma
+    return z.abs() > thresh
+
+def simple_linear_forecast(series: pd.Series, steps: int = 3) -> List[float]:
+    if series.empty:
+        return [0.0] * steps
+    x = np.arange(len(series))
+    y = series.values
+    A = np.vstack([x, np.ones(len(x))]).T
+    m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+    preds = [float(m * (len(x) + i) + c) for i in range(steps)]
+    return preds
 
 # ---------------- Charts ----------------
 def generate_line_chart(df: pd.DataFrame, metric_name: str, out_name: str) -> Path:
@@ -560,57 +229,38 @@ def generate_line_chart(df: pd.DataFrame, metric_name: str, out_name: str) -> Pa
         plt.figure(figsize=(6, 3))
         plt.text(0.5, 0.5, "No data", ha="center", va="center")
         plt.axis("off")
-        plt.savefig(out, bbox_inches="tight", dpi=100)
+        plt.savefig(out, bbox_inches="tight", dpi=120)
         plt.close()
         return out
     plt.figure(figsize=(8, 3.5))
-    plt.plot(dfm["timestamp"], dfm["value"], marker="o", linewidth=1.5, label=metric_name, color="#2196F3")
-    if len(dfm) > 2:
-        ma = dfm["value"].rolling(window=max(2, int(len(dfm) / 2)), min_periods=1).mean()
-        plt.plot(dfm["timestamp"], ma, linestyle="--", label="Moving Avg", color="#FF9800", linewidth=1)
-        plt.fill_between(dfm["timestamp"], dfm["value"], ma, alpha=0.1)
-    plt.title(f"{metric_name}", fontsize=12, fontweight="bold")
-    plt.xlabel("Time", fontsize=10)
-    plt.ylabel(metric_name, fontsize=10)
-    plt.legend(fontsize=9)
-    plt.xticks(rotation=45)
+    plt.plot(dfm["timestamp"], dfm["value"], marker="o", linewidth=1, label=metric_name)
+    ma = moving_average(dfm["value"], window=max(2, int(len(dfm) / 6)))
+    plt.plot(dfm["timestamp"], ma, linestyle="--", label="Moving Avg")
+    plt.fill_between(dfm["timestamp"], dfm["value"], ma, alpha=0.08)
+    plt.title(f"{metric_name} — last {dfm['timestamp'].max() - dfm['timestamp'].min()}")
+    plt.xlabel("Time")
+    plt.ylabel(metric_name)
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(out, dpi=120, bbox_inches="tight")
+    plt.savefig(out, dpi=120)
     plt.close()
     return out
 
-def generate_pie_chart(cpu_value: float, disk_value: Optional[float], mem_value: Optional[float], out_name: str) -> Path:
-    fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
-    # CPU
-    cpu_used = max(0.0, min(100.0, float(cpu_value or 0)))
-    cpu_free = 100.0 - cpu_used
-    axes[0].pie([cpu_used, cpu_free], labels=["Used", "Free"], autopct="%1.1f%%", colors=["#FF6B6B", "#4ECDC4"], startangle=90)
-    axes[0].set_title(f"CPU ({cpu_used:.1f}%)", fontweight="bold")
-    # Disk
-    if disk_value is not None:
-        disk_used = max(0.0, min(100.0, float(disk_value or 0)))
-        disk_free = 100.0 - disk_used
-        axes[1].pie([disk_used, disk_free], labels=["Used", "Free"], autopct="%1.1f%%", colors=["#FF6B6B", "#4ECDC4"], startangle=90)
-        axes[1].set_title(f"Disk ({disk_used:.1f}%)", fontweight="bold")
-    else:
-        axes[1].axis("off")
-        axes[1].text(0.5, 0.5, "Disk % N/A", ha="center", va="center")
-    # Memory
-    if mem_value is not None:
-        mem_used = max(0.0, min(100.0, float(mem_value or 0)))
-        mem_free = 100.0 - mem_used
-        axes[2].pie([mem_used, mem_free], labels=["Used", "Free"], autopct="%1.1f%%", colors=["#FF6B6B", "#4ECDC4"], startangle=90)
-        axes[2].set_title(f"Memory ({mem_used:.1f}%)", fontweight="bold")
-    else:
-        axes[2].axis("off")
-        axes[2].text(0.5, 0.5, "Memory % N/A", ha="center", va="center")
-    plt.tight_layout()
+def generate_pie_chart(cpu_value: float, out_name: str) -> Path:
+    used = float(cpu_value) if cpu_value is not None else 0.0
+    used = max(0.0, min(100.0, used))
+    free = 100.0 - used
+    labels = ["Used CPU %", "Free CPU %"]
+    values = [used, free]
     out = OUTPUT_DIR / out_name
+    plt.figure(figsize=(4, 4))
+    plt.pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
+    plt.title("CPU Usage (latest)")
     plt.savefig(out, dpi=120, bbox_inches="tight")
     plt.close()
     return out
 
-# ---------------- CSV builders ----------------
+# ---------------- CSV ----------------
 def save_csv(rows: List[List], filename: str) -> Path:
     p = OUTPUT_DIR / filename
     with open(p, "w", newline="") as f:
@@ -619,70 +269,63 @@ def save_csv(rows: List[List], filename: str) -> Path:
         w.writerows(rows)
     return p
 
-def build_alert_csv(metrics: dict, health: dict, cpu_threshold: float, disk_threshold: float, mem_threshold: float) -> Path:
-    p = OUTPUT_DIR / f"alert_report_{int(time.time())}.csv"
+def build_failed_csv(cpu: Optional[float], mem_pct_free: Optional[float]) -> Path:
+    rows = []
+    ts = datetime.utcnow().isoformat()
+    if cpu is not None and cpu > CPU_THRESHOLD:
+        rows.append([ts, "Percentage CPU", cpu, CPU_THRESHOLD])
+    if mem_pct_free is not None and mem_pct_free < MEM_FREE_PCT_THRESHOLD:
+        rows.append([ts, "Available Memory % Free", mem_pct_free, MEM_FREE_PCT_THRESHOLD])
+    p = OUTPUT_DIR / f"alert_failed_{int(time.time())}.csv"
     with open(p, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["timestamp", "metric", "value", "threshold", "status"])
-        w.writerow([metrics["timestamp"], "CPU %", metrics.get("cpu_percent"), cpu_threshold, health["cpu_status"]])
-        w.writerow([metrics["timestamp"], "Disk %", metrics.get("disk_percent"), disk_threshold, health["disk_status"]])
-        w.writerow([metrics["timestamp"], "Memory %", metrics.get("memory_percent"), mem_threshold, health["memory_status"]])
+        w.writerow(["timestamp", "metric", "value", "threshold"])
+        w.writerows(rows)
     return p
 
-def save_top_csv(name: str, rows: List[Dict[str,Any]], cols: List[str]) -> Path:
-    p = OUTPUT_DIR / f"{name}_{int(time.time())}.csv"
-    with open(p, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(cols)
-        for r in rows:
-            w.writerow([r.get(c) for c in cols])
-    return p
+# ---------------- Email (robust CID handling) ----------------
+def _attach_cid_image(msg: MIMEMultipart, cid: str, file_path: Optional[Path]) -> None:
+    """
+    Attach as inline CID image with extra Gmail/Outlook-friendly headers.
+    """
+    if not file_path or not os.path.isfile(str(file_path)):
+        return
+    try:
+        with open(file_path, "rb") as imgf:
+            img = MIMEImage(imgf.read())
+            img.add_header("Content-ID", f"<{cid}>")
+            img.add_header("Content-Disposition", "inline", filename=os.path.basename(str(file_path)))
+            img.add_header("X-Attachment-Id", cid)
+            msg.attach(img)
+    except Exception as e:
+        print(f"Failed to attach inline image {cid}: {e}")
 
-# ---------------- Email ----------------
-def send_email_with_html(subject: str, html_body: str, attachments: List[Path], cid_images: List[Tuple[str, Path]] = None) -> bool:
+def send_email_with_html(subject: str, html_body: str, attachments: List[Path], inline_cids: Dict[str, Path] = None) -> bool:
+    """
+    Sends HTML email with optional attachments and inline CID images.
+    For best compatibility: root multipart/related, HTML part as MIMEText (text/html),
+    then CID images attached directly to the same 'related' container.
+    """
     if not (EMAIL_TO and EMAIL_FROM and SMTP_USER and SMTP_PASS and SMTP_SERVER):
-        print(f"{ICONS['warning']} Email not sent - SMTP config missing in .env")
+        print("Email not sent - SMTP config missing in .env")
         return False
     try:
-        msg = MIMEMultipart("mixed")
+        msg = MIMEMultipart("related")
         msg["From"] = EMAIL_FROM
         msg["To"] = EMAIL_TO
         msg["Subject"] = subject
 
-        related = MIMEMultipart("related")
-        alt = MIMEMultipart("alternative")
-        alt.attach(MIMEText(html_body, "html"))
-        related.attach(alt)
-        msg.attach(related)
+        # HTML body
+        msg.attach(MIMEText(html_body, "html"))
 
-        
+        # Inline images (logo + optional charts)
+        if inline_cids:
+            for cid, path in inline_cids.items():
+                _attach_cid_image(msg, cid, Path(path) if path else None)
 
-        # CID images
-        for cid, img_path in (cid_images or []):
-            try:
-                with open(img_path, "rb") as fp:
-                    img_data = fp.read()
-
-                mime_type, _ = mimetypes.guess_type(img_path)
-                subtype = mime_type.split("/")[-1] if mime_type else "png"
-
-                img = MIMEImage(img_data, _subtype=subtype)
-                img.add_header("Content-ID", f"<{cid}>")
-                img.add_header("Content-Disposition", "inline", filename=img_path.name)
-
-                related.attach(img)
-                print(f"✔ CID image attached: {img_path}")
-
-            except Exception as e:
-                print("❌ Failed CID attach:", img_path, e)
-
-
-
-
-        # Attachments
+        # Regular attachments
         for file_path in attachments or []:
             try:
-                if not file_path or not Path(file_path).exists():
-                    continue
                 with open(file_path, "rb") as fp:
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(fp.read())
@@ -697,776 +340,1221 @@ def send_email_with_html(subject: str, html_body: str, attachments: List[Path], 
             s.login(SMTP_USER, SMTP_PASS)
             s.send_message(msg)
 
-        print("Email sent:", subject)
+        print("📧 Email sent:", subject)
         return True
     except Exception as e:
-        print("Email send error:", e)
+        print("❌ Email send error:", e)
         return False
 
-# ---------------- Cloud AI (optional but attempted) ----------------
-def _extract_text_from_block(block) -> Optional[str]:
-    try:
-        if isinstance(block, MessageTextContent):
-            txt_obj = getattr(block, "text", None)
-            return getattr(txt_obj, "value", None) or (str(txt_obj) if txt_obj is not None else None)
-    except Exception:
-        pass
-    if isinstance(block, dict):
-        if block.get("type") == "text":
-            t = block.get("text")
-            if isinstance(t, dict):
-                return t.get("value") or t.get("text") or ""
-            return str(t) if t is not None else ""
-        for key in ("value", "text"):
-            v = block.get(key)
-            if isinstance(v, dict):
-                return v.get("value") or v.get("text") or ""
-            if v:
-                return str(v)
-    t = getattr(block, "text", None)
-    if isinstance(t, dict):
-        return t.get("value") or t.get("text") or ""
-    return (getattr(t, "value", None) or (str(t) if t is not None else None))
+# ---------------- Health / Severity / Alerts ----------------
+def compute_status_and_severity(value: Optional[float], threshold: float) -> Tuple[str, Optional[str]]:
+    if value is None or np.isnan(value):
+        return ("Unknown", None)
+    diff = value - threshold
+    if diff >= SEVERITY_MARGIN_P1:
+        return ("Critical", "P1")
+    elif diff >= SEVERITY_MARGIN_P2:
+        return ("Critical", "P2")
+    elif diff >= SEVERITY_MARGIN_P3:
+        return ("Warning", "P3")
+    else:
+        return ("Healthy", None)
 
-def _normalize_vm_health_text(text: str) -> str:
-    if not text:
-        return text
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    def _humanize_bytes(val: float) -> str:
-        units = ["B", "KB", "MB", "GB", "TB", "PB"]
-        i = 0
-        while val >= 1024.0 and i < len(units)-1:
-            val /= 1024.0
-            i += 1
-        return f"{val:0.2f} {units[i]}"
-    disk_patterns = [
-        (re.compile(r"^-?\s*Disk Read\s*\(.*?\):\s*([0-9]*\.?[0-9]+)"), "Disk Read"),
-        (re.compile(r"^-?\s*Disk Write\s*\(.*?\):\s*([0-9]*\.?[0-9]+)"), "Disk Write"),
-    ]
-    for idx, ln in enumerate(lines):
-        for pat, label in disk_patterns:
-            m = pat.match(ln.strip())
-            if m:
-                try:
-                    val = float(m.group(1))
-                except Exception:
-                    continue
-                lines[idx] = f"- {label} (avg): {_humanize_bytes(val)}"
-                break
-    def _map_forecast_label(ln: str) -> str:
-        m = re.match(r"^-\s*CPU\s*(\d+)\s*m:\s*(.+)$", ln.strip())
-        if not m:
-            return ln
-        mins = int(m.group(1)); val = m.group(2).strip()
-        plus = {15: "+1", 30: "+2", 60: "+3"}.get(mins)
-        return f"- CPU {plus}: {val}" if plus else ln
-    lines = [(_map_forecast_label(ln)) for ln in lines]
-    try:
-        start = next(i for i, ln in enumerate(lines) if ln.strip().lower().startswith("recommendations:"))
-        recs = []
-        for j in range(start+1, len(lines)):
-            s = lines[j].strip()
-            if not s or (not s.startswith("- ") and ":" in s and s.split(":")[0].istitle()):
-                break
-            if s.startswith("- "):
-                val = s[2:].strip()
-                if val and val not in recs:
-                    recs.append(val)
-        recs = recs[:5]
-        new_block = ["Recommendations:"] + [f"- {r}" for r in recs]
-        k = start + 1
-        while k < len(lines) and lines[k].strip().startswith("- "):
-            k += 1
-        lines = lines[:start] + new_block + lines[k:]
-    except StopIteration:
-        pass
-    return "\n".join(lines).strip()
+def aggregate_overall(cpu_status: str, mem_status: str, disk_status: str) -> str:
+    statuses = [cpu_status, mem_status, disk_status]
+    if "Critical" in statuses:
+        return "Critical"
+    if "Warning" in statuses:
+        return "Warning"
+    if all(s in ("Healthy", "Unknown") for s in statuses):
+        return "Healthy"
+    return "Unknown"
 
-def run_cloud_ai_mandatory(df: pd.DataFrame) -> str:
-    if not AZURE_AI_AVAILABLE:
-        return "❌ Cloud AI error: SDK missing."
-    try:
-        if USE_API_KEY and AZURE_API_KEY:
-            agent_client = AgentsClient(endpoint=PROJECT_ENDPOINT, api_key=AZURE_API_KEY)  # type: ignore
-        else:
-            _credential = DefaultAzureCredential(exclude_cli_credential=False)
-            agent_client = AgentsClient(endpoint=PROJECT_ENDPOINT, credential=_credential)
-
-        cpu_df        = df[df["metric"] == "Percentage CPU"].sort_values("timestamp")
-        disk_read_df  = df[df["metric"] == "Disk Read Bytes"].sort_values("timestamp")
-        disk_write_df = df[df["metric"] == "Disk Write Bytes"].sort_values("timestamp")
-        if cpu_df.empty and disk_read_df.empty and disk_write_df.empty:
-            return "⚠ Cloud AI: no metrics to analyze."
-        def to_series_list(dff: pd.DataFrame) -> List[Dict[str, Any]]:
-            return [{"timestamp": str(r.timestamp), "value": float(r.value)} for r in dff.itertuples()]
-
-        payload = {
-            "cpu": to_series_list(cpu_df),
-            "disk_read": to_series_list(disk_read_df),
-            "disk_write": to_series_list(disk_write_df),
-        }
-
-        instructions = (
-            "You are the SkynetOps VM Health Analysis Agent.\n"
-            "You will receive JSON with VM CPU and disk metrics.\n\n"
-            "JSON FORMAT:\n"
-            "{\n"
-            "  'cpu': [ { 'timestamp': '2025-12-09T10:00:00', 'value': 74.2 }, ... ],\n"
-            "  'disk_read': [ { 'timestamp': '2025-12-09T10:00:00', 'value': 123456 }, ... ],\n"
-            "  'disk_write': [ { 'timestamp': '2025-12-09T10:00:00', 'value': 789012 }, ... ]\n"
-            "}\n\n"
-            "Tasks:\n"
-            "- Compute latest CPU and disk read/write levels.\n"
-            "- Min/Max/Avg for CPU, disk read, disk write.\n"
-            "- Detect anomalies (z-score > 2.5) on CPU and disk.\n"
-            "- Forecast CPU for 15m/30m/60m.\n"
-            "- Overall VM health status (Healthy / Warning / Critical).\n"
-            "- Disk health status (Normal | Saturated | Highly active).\n"
-            "- Recommendations.\n\n"
-            "OUTPUT FORMAT STRICT:\n"
-            "VM Health Summary:\n"
-            "- CPU Current: <value>%\n"
-            "- CPU Min/Max/Avg: <min>/<max>/<avg>%\n"
-            "- Disk Read (avg bytes/min): <value>\n"
-            "- Disk Write (avg bytes/min): <value>\n"
-            "- CPU Anomalies: <count>\n"
-            "- Disk Anomalies: <count>\n\n"
-            "Forecast:\n"
-            "- CPU 15m: <value>%\n"
-            "- CPU 30m: <value>%\n"
-            "- CPU 60m: <value>%\n\n"
-            "Status:\n"
-            "- VM: <Healthy | Warning | Critical>\n"
-            "- Disk: <Normal | Saturated | Highly active>\n\n"
-            "BOTTLENECKS:\n"
-            "- <issue>\n"
-            "- <issue>\n"
-            "- <issue>\n"
-            "Recommendations:\n"
-            "- <action 1>\n"
-            "- <action 2>\n"
-            "- <action 3>\n"
-            "- <action 4>\n"
-            "- <action 5>\n"
-            "- <action 6>\n"
-        )
-
-        agent = agent_client.create_agent(
-            model=MODEL_DEPLOYMENT,
-            name=f"skynetops-agent-{int(time.time())}",
-            instructions=instructions,
-            tools=[],
-        )
-        thread = agent_client.threads.create()
-        agent_client.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=f"Here is the VM CPU and disk data in JSON:\n{payload}\n\nProvide the VM Health Summary.",
-        )
-        run = agent_client.runs.create(thread_id=thread.id, agent_id=agent.id)
-
-        deadline = time.time() + AI_DEADLINE_SEC
-        status = getattr(run, "status", None)
-        while status not in ("completed", "failed", "cancelled", "expired") and time.time() < deadline:
-            time.sleep(AI_POLL_EVERY_SEC)
-            run = agent_client.runs.get(thread_id=thread.id, run_id=run.id)
-            status = getattr(run, "status", None)
-
-        if status != "completed":
-            try:
-                agent_client.agents.delete_agent(agent.id)
-            except Exception:
-                pass
-
-        try:
-            messages = agent_client.messages.list(thread_id=thread.id, order="asc")
-            summary_parts: List[str] = []
-            for msg in messages:
-                role_val = getattr(msg, "role", None)
-                if role_val == MessageRole.AGENT or str(role_val).lower() == "assistant":
-                    if getattr(msg, "text_messages", None):
-                        for text_msg in msg.text_messages:
-                            try:
-                                summary_parts.append(text_msg.text.value)
-                            except Exception:
-                                if hasattr(text_msg, "text"):
-                                    summary_parts.append(str(text_msg.text))
-                        continue
-                    content = getattr(msg, "content", None)
-                    if content:
-                        for block in content:
-                            text_val = _extract_text_from_block(block)
-                            if text_val:
-                                summary_parts.append(text_val)
-            try:
-                agent_client.agents.delete_agent(agent.id)
-            except Exception:
-                pass
-            summary = "\n".join([s for s in summary_parts if s]).strip()
-            if not summary:
-                return "⚠ Agent returned no analysis."
-            return _normalize_vm_health_text(summary)
-        except Exception as e:
-            try:
-                agent_client.agents.delete_agent(agent.id)
-            except Exception:
-                pass
-            return f"⚠ Error parsing agent messages: {e}"
-    except Exception as e:
-        return f"❌ Cloud AI error: {e}"
-
-# ---------------- Health check & HTML sections ----------------
-def check_remote_health(metrics: dict, cpu_threshold: float, disk_threshold: float, mem_threshold: float) -> dict:
+def build_triggered_alerts(metrics: Dict[str, Any],
+                           thresholds: Dict[str, float],
+                           anomaly_counts: Dict[str, int]) -> List[Dict[str, str]]:
     alerts = []
-    cpu_status = f"{ICONS['safe']} Safe"
-    disk_status = f"{ICONS['safe']} Safe"
-    mem_status = f"{ICONS['safe']} Safe"
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    # CPU
+    cpu_v = metrics.get("cpu_percent")
+    if cpu_v is not None and not np.isnan(cpu_v) and cpu_v > thresholds.get("cpu", 0.0):
+        _, sev = compute_status_and_severity(cpu_v, thresholds["cpu"])
+        alerts.append({"when": now, "metric": "CPU Usage", "value": f"{cpu_v:.2f}%", "threshold": f"{thresholds['cpu']:.2f}%", "severity": sev or "-", "note": "High CPU usage"})
+    # Memory (usage)
+    mem_v = metrics.get("memory_percent")
+    if mem_v is not None and not np.isnan(mem_v) and mem_v > thresholds.get("mem", 0.0):
+        _, sev = compute_status_and_severity(mem_v, thresholds["mem"])
+        alerts.append({"when": now, "metric": "Memory Usage", "value": f"{mem_v:.2f}%", "threshold": f"{thresholds['mem']:.2f}%", "severity": sev or "-", "note": "High memory usage"})
+    # Disk (usage)
+    disk_v = metrics.get("disk_percent")
+    if disk_v is not None and not np.isnan(disk_v) and disk_v > thresholds.get("disk", 0.0):
+        _, sev = compute_status_and_severity(disk_v, thresholds["disk"])
+        alerts.append({"when": now, "metric": "Disk Usage", "value": f"{disk_v:.2f}%", "threshold": f"{thresholds['disk']:.2f}%", "severity": sev or "-", "note": "High disk usage"})
+    # Anomalies
+    if anomaly_counts.get("disk_read", 0) > 0:
+        alerts.append({"when": now, "metric": "Disk Read", "value": f"anomalies={anomaly_counts['disk_read']}", "threshold": "-", "severity": "-", "note": "Read throughput anomalies detected"})
+    if anomaly_counts.get("disk_write", 0) > 0:
+        alerts.append({"when": now, "metric": "Disk Write", "value": f"anomalies={anomaly_counts['disk_write']}", "threshold": "-", "severity": "-", "note": "Write throughput anomalies detected"})
+    return alerts
 
-    if metrics.get("cpu_percent") is not None and metrics["cpu_percent"] > cpu_threshold:
-        cpu_status = f"{ICONS['alert']} HIGH ({metrics['cpu_percent']:.2f}%)"
-        alerts.append(f"HIGH CPU usage >{cpu_threshold}%: {metrics['cpu_percent']:.2f}%")
-    else:
-        cpu_status = f"{ICONS['safe']} Safe ({metrics.get('cpu_percent', 0.0):.2f}%)"
+def render_alerts_html(alerts: List[Dict[str, str]]) -> str:
+    if not alerts:
+        return '<div style="color:#6b7280; font-size:13px;">No active alerts at this time.</div>'
+    rows = []
+    for a in alerts:
+        rows.append(
+            "<tr>"
+            f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(a['when'])}</td>"
+            f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(a['metric'])}</td>"
+            f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(a['value'])}</td>"
+            f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(a['threshold'])}</td>"
+            f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#b91c1c;'>{html_escape(a['severity'])}</td>"
+            f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#374151;'>{html_escape(a['note'])}</td>"
+            "</tr>"
+        )
+    return (
+        "<table width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse; background:#ffffff; border:1px solid #e5e7eb;' bgcolor='#ffffff'>"
+        "<thead>"
+        "<tr style='background:#f3f4f6;' bgcolor='#f3f4f6'>"
+        "<th align='left' style='padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;'>Time (UTC)</th>"
+        "<th align='left' style='padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;'>Metric</th>"
+        "<th align='left' style='padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;'>Value</th>"
+        "<th align='left' style='padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;'>Threshold</th>"
+        "<th align='left' style='padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;'>Severity</th>"
+        "<th align='left' style='padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;'>Note</th>"
+        "</tr>"
+        "</thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
 
-    if metrics.get("disk_percent") is not None:
-        if metrics["disk_percent"] > disk_threshold:
-            disk_status = f"{ICONS['alert']} HIGH ({metrics['disk_percent']:.2f}%)"
-            alerts.append(f"HIGH Disk capacity used >{disk_threshold}%: {metrics['disk_percent']:.2f}%")
-        else:
-            disk_status = f"{ICONS['safe']} Safe ({metrics['disk_percent']:.2f}%)"
-    else:
-        disk_status = f"{ICONS['warning']} N/A (capacity metric unavailable)"
+# ---------------- Agent-run helper ----------------
+def run_agent_analysis_direct(agent_client: AgentsClient, df: pd.DataFrame) -> str:
+    cpu_df = df[df["metric"] == "Percentage CPU"].sort_values("timestamp")
+    cpu_df = cpu_df[cpu_df["value"].astype(float) > 0.0]
+    disk_read_df = df[df["metric"] == "Disk Read Bytes"].sort_values("timestamp")
+    disk_write_df = df[df["metric"] == "Disk Write Bytes"].sort_values("timestamp")
 
-    if metrics.get("memory_percent") is not None:
-        if metrics["memory_percent"] > mem_threshold:
-            mem_status = f"{ICONS['alert']} HIGH ({metrics['memory_percent']:.2f}%)"
-            alerts.append(f"HIGH Memory usage >{mem_threshold}%: {metrics['memory_percent']:.2f}%")
-        else:
-            mem_status = f"{ICONS['safe']} Safe ({metrics['memory_percent']:.2f}%)"
-    else:
-        mem_status = f"{ICONS['warning']} N/A (metric unavailable)"
+    cpu_data = [{"timestamp": str(row.timestamp), "value": float(row.value)} for row in cpu_df.itertuples()]
+    disk_read_data = [{"timestamp": str(row.timestamp), "value": float(row.value)} for row in disk_read_df.itertuples()]
+    disk_write_data = [{"timestamp": str(row.timestamp), "value": float(row.value)} for row in disk_write_df.itertuples()]
 
-    return {
-        "is_healthy": len(alerts) == 0,
-        "cpu_status": cpu_status,
-        "disk_status": disk_status,
-        "memory_status": mem_status,
-        "alerts": alerts,
+    ssh_cpu_now = None
+    ssh_total = None
+    ssh_available = None
+    ssh_mem_free_pct = None
+    ssh_top = None
+    try:
+        ssh_cpu_now = ssh_get_overall_cpu()
+    except Exception:
+        ssh_cpu_now = None
+    try:
+        ssh_total, ssh_available = ssh_get_memory_info()
+        if ssh_total and ssh_available:
+            ssh_mem_free_pct = (ssh_available / ssh_total) * 100.0
+    except Exception:
+        ssh_total, ssh_available, ssh_mem_free_pct = None, None, None
+    try:
+        ssh_top = ssh_get_top_processes(max_rows=5)
+    except Exception:
+        ssh_top = None
+
+    if ssh_cpu_now is not None:
+        cpu_data.append({"timestamp": datetime.utcnow().isoformat(), "value": float(ssh_cpu_now)})
+
+    instructions = (
+        "You are the SkynetOps SRE Incident Response Agent.\n"
+        "You will receive VM telemetry as JSON with time series arrays for CPU and Disk I/O, "
+        "and an SSH snapshot with current CPU/memory and top processes.\n\n"
+        "JSON INPUT SCHEMA:\n"
+        "{\n"
+        "  'cpu': [ { 'timestamp': 'YYYY-MM-DDTHH:MM:SS', 'value': <percent_float> }, ... ],\n"
+        "  'disk_read': [ { 'timestamp': 'YYYY-MM-DDTHH:MM:SS', 'value': <bytes_float> }, ... ],\n"
+        "  'disk_write': [ { 'timestamp': 'YYYY-MM-DDTHH:MM:SS', 'value': <bytes_float> }, ... ],\n"
+        "  'ssh': {\n"
+        "    'cpu_current_pct': <float or null>,\n"
+        "    'mem_total_bytes': <int or null>,\n"
+        "    'mem_available_bytes': <int or null>,\n"
+        "    'mem_free_pct': <float or null>,\n"
+        "    'top': {\n"
+        "       'cpu': [ {'pid': str, 'command': str, 'cpu_pct': str}, ... ],\n"
+        "       'memory': [ {'pid': str, 'command': str, 'mem_pct': str, 'rss_kb': str}, ... ],\n"
+        "       'disk': [ {'pid': str, 'command': str, 'kb_rd_s': str, 'kb_wr_s': str}, ... ]\n"
+        "    }\n"
+        "  }\n"
+        "}\n\n"
+        "SRE TASKS:\n"
+        "1) Compute latest levels (current CPU %, current disk read/write bytes per interval).\n"
+        "2) Compute Min/Max/Avg for CPU, disk read, disk write (ignore empty series).\n"
+        "3) Detect anomalies using z-score > 2.5 on CPU and on each disk series; report counts.\n"
+        "4) Forecast CPU for 15m/30m/60m using a simple linear trend over the provided series.\n"
+        "5) Determine health:\n"
+        "   - VM: Healthy | Warning | Critical (based on sustained CPU and anomaly presence).\n"
+        "   - Disk: Normal | Saturated | Highly active (based on sustained write/read volume and anomalies).\n"
+        "6) Produce SRE runbook-style guidance:\n"
+        "   - Immediate Actions (step-by-step triage a responder can perform now).\n"
+        "   - Diagnostics to Run (concrete Linux commands; prefer safe, read-only checks).\n"
+        "   - Mitigations (short-term controls to reduce impact, e.g., throttle, restart safe services, scale out).\n"
+        "   - Follow-up / Prevention (longer-term fixes, monitoring, SLO/SLA alignment).\n"
+        "7) Use SSH snapshot for current CPU/memory context and top offenders; align recommendations to observed top processes.\n"
+        "8) Be concise, action-oriented, and avoid speculation beyond the data. If data is missing (e.g., memory), call it out explicitly and provide general steps.\n\n"
+        "OUTPUT FORMAT (STRICT):\n"
+        "SRE Incident Report\n"
+        "Summary:\n"
+        "- CPU Current: <value>%\n"
+        "- CPU Min/Max/Avg: <min>/<max>/<avg>%\n"
+        "- Disk Read (avg bytes/interval): <value>\n"
+        "- Disk Write (avg bytes/interval): <value>\n"
+        "- CPU Anomalies: <count>\n"
+        "- Disk Anomalies: <count>\n\n"
+        "Forecast:\n"
+        "- CPU 15m: <value>%\n"
+        "- CPU 30m: <value>%\n"
+        "- CPU 60m: <value>%\n\n"
+        "Status:\n"
+        "- VM: <Healthy | Warning | Critical>\n"
+        "- Disk: <Normal | Saturated | Highly active>\n\n"
+        "Top Findings:\n"
+        "- <concise finding 1>\n"
+        "- <concise finding 2>\n"
+        "- <concise finding 3>\n\n"
+        "Immediate Actions (Runbook):\n"
+        "1. <action>\n"
+        "2. <action>\n"
+        "3. <action>\n"
+        "4. <action>\n"
+        "5. <action>\n\n"
+        "Diagnostics to Run (Linux):\n"
+        "- <command 1>\n"
+        "- <command 2>\n"
+        "- <command 3>\n"
+        "- <command 4>\n"
+        "- <command 5>\n\n"
+        "Mitigations:\n"
+        "- <mitigation 1>\n"
+        "- <mitigation 2>\n"
+        "- <mitigation 3>\n\n"
+        "Follow-up / Prevention:\n"
+        "- <follow-up 1>\n"
+        "- <follow-up 2>\n"
+        "- <follow-up 3>\n"
+    )
+
+    agent = agent_client.create_agent(
+        model=MODEL_DEPLOYMENT,
+        name=f"skynetops-agent-{int(time.time())}",
+        instructions=instructions,
+        tools=[],
+    )
+
+    thread = agent_client.threads.create()
+    payload = {
+        "cpu": cpu_data,
+        "disk_read": disk_read_data,
+        "disk_write": disk_write_data,
+        "ssh": {
+            "cpu_current_pct": float(ssh_cpu_now) if ssh_cpu_now is not None else None,
+            "mem_total_bytes": int(ssh_total) if ssh_total is not None else None,
+            "mem_available_bytes": int(ssh_available) if ssh_available is not None else None,
+            "mem_free_pct": float(ssh_mem_free_pct) if ssh_mem_free_pct is not None else None,
+            "top": ssh_top,
+        },
     }
 
-def html_table_top_cpu(rows: List[Dict[str, Any]]) -> str:
-    if not rows:
-        return "<p>No process data available.</p>"
-    tr = []
-    for r in rows:
-        tr.append(
-            "<tr>"
-            f"<td>{r.get('PID','')}</td>"
-            f"<td>{html.escape(str(r.get('Process','')))}</td>"
-            f"<td>{html.escape(str(r.get('User','')))}</td>"
-            f"<td style='text-align:right'>{float(r.get('CPUPercent',0.0)):.1f}%</td>"
-            f"<td style='text-align:right'>{human_bytes(float(r.get('RSSBytes',0.0)))}</td>"
-            "</tr>"
-        )
-    return (
-        "<table class='summary' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
-        "<thead><tr>"
-        "<th>PID</th><th>Name</th><th>User</th><th>CPU %</th><th>RSS</th>"
-        "</tr></thead><tbody>" + "".join(tr) + "</tbody></table>"
+    agent_client.messages.create(
+        thread_id=thread.id,
+        role="user",
+        content=f"Here is the VM telemetry JSON:\n{payload}\n\nProvide the SRE Incident Report.",
     )
 
-def html_table_top_mem(rows: List[Dict[str, Any]]) -> str:
-    if not rows:
-        return "<p>No process data available.</p>"
-    tr = []
-    for r in rows:
-        tr.append(
-            "<tr>"
-            f"<td>{r.get('PID','')}</td>"
-            f"<td>{html.escape(str(r.get('Process','')))}</td>"
-            f"<td>{html.escape(str(r.get('User','')))}</td>"
-            f"<td style='text-align:right'>{human_bytes(float(r.get('RSSBytes',0.0)))}</td>"
-            f"<td style='text-align:right'>{float(r.get('CPUPercent',0.0)):.1f}%</td>"
-            "</tr>"
+    agent_client.runs.create_and_process(thread_id=thread.id, agent_id=agent.id)
+
+    summary = ""
+    try:
+        messages = agent_client.messages.list(thread_id=thread.id, order="asc")
+        for message in messages:
+            if message.role == MessageRole.AGENT:
+                if getattr(message, "text_messages", None):
+                    for text_msg in message.text_messages:
+                        summary += text_msg.text.value + "\n"
+                elif getattr(message, "content", None):
+                    for content_block in message.content:
+                        if isinstance(content_block, MessageTextContent):
+                            summary += content_block.text.value + "\n"
+                        elif getattr(content_block, "type", None) == "text":
+                            text_obj = getattr(content_block, "text", None)
+                            if text_obj is not None and hasattr(text_obj, "value"):
+                                summary += text_obj.value + "\n"
+                            elif text_obj is not None:
+                                summary += str(text_obj) + "\n"
+    except Exception as e:
+        print(f"Error parsing messages: {e}")
+        summary = f"⚠ Error retrieving agent analysis: {e}"
+
+    try:
+        agent_client.agents.delete_agent(agent.id)
+    except Exception:
+        pass
+
+    if not summary.strip():
+        summary = "⚠ Agent returned no analysis."
+    return summary.strip()
+
+# ---------------- SSH ----------------
+def _ssh_connect() -> Optional['paramiko.SSHClient']:
+    if paramiko is None:
+        print("SSH not available: paramiko not installed.")
+        return None
+    if not (VM_SSH_HOST and VM_SSH_USERNAME and (VM_SSH_KEY_PATH or VM_SSH_PASSWORD)):
+        print("SSH not configured: set VM_SSH_HOST, VM_SSH_USERNAME, and either VM_SSH_KEY_PATH or VM_SSH_PASSWORD.")
+        return None
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if VM_SSH_KEY_PATH:
+            pkey = None
+            try:
+                pkey = paramiko.RSAKey.from_private_key_file(VM_SSH_KEY_PATH)
+            except Exception:
+                try:
+                    pkey = paramiko.Ed25519Key.from_private_key_file(VM_SSH_KEY_PATH)
+                except Exception:
+                    pkey = None
+            client.connect(VM_SSH_HOST, port=VM_SSH_PORT, username=VM_SSH_USERNAME,
+                           pkey=pkey, timeout=20, compress=True, allow_agent=True, look_for_keys=True)
+        else:
+            client.connect(VM_SSH_HOST, port=VM_SSH_PORT, username=VM_SSH_USERNAME,
+                           password=VM_SSH_PASSWORD, timeout=20, compress=True, allow_agent=True, look_for_keys=True)
+        return client
+    except Exception as e:
+        print("SSH connection error:", e)
+        return None
+
+def _ssh_exec(client: 'paramiko.SSHClient', command: str) -> str:
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=30)
+        out = stdout.read().decode(errors="ignore")
+        err = stderr.read().decode(errors="ignore")
+        if err and not out:
+            return err
+        return out or err or ""
+    except Exception as e:
+        return f"ERROR: {e}"
+
+def _parse_ps_table(text: str, expect_cols: int) -> List[List[str]]:
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    rows = []
+    for i, line in enumerate(lines):
+        if i == 0:
+            continue
+        parts = line.split(None, expect_cols - 1)
+        if len(parts) >= expect_cols:
+            rows.append(parts[:expect_cols])
+    return rows
+
+def ssh_get_overall_cpu() -> Optional[float]:
+    client = _ssh_connect()
+    if client is None:
+        return None
+    try:
+        cmd = (
+            "bash -lc '"
+            "if command -v mpstat >/dev/null 2>&1; then "
+            "  mpstat 1 1 | awk \"/Average/ {print 100 - \\$NF}\"; "
+            "elif command -v top >/dev/null 2>&1; then "
+            "  top -bn1 | grep \"Cpu(s)\" | awk -F\"id,\" \"{ split(\\$1, cpu, \\\" \\\" ); print 100 - cpu[length(cpu)] }\"; "
+            "else echo NA; fi'"
         )
+        out = _ssh_exec(client, cmd).strip()
+        try:
+            val = float(out)
+            return max(0.0, min(100.0, val))
+        except Exception:
+            return None
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+def ssh_get_memory_info() -> Tuple[Optional[int], Optional[int]]:
+    client = _ssh_connect()
+    if client is None:
+        return None, None
+    try:
+        cmd = "bash -lc 'cat /proc/meminfo | egrep \"^(MemTotal|MemAvailable):\"'"
+        out = _ssh_exec(client, cmd)
+        mem_total_kb = None
+        mem_available_kb = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try: mem_total_kb = float(parts[1])
+                    except Exception: pass
+            elif line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try: mem_available_kb = float(parts[1])
+                    except Exception: pass
+        mem_total_bytes = int(mem_total_kb * 1024) if mem_total_kb is not None else None
+        mem_available_bytes = int(mem_available_kb * 1024) if mem_available_kb is not None else None
+        return mem_total_bytes, mem_available_bytes
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+# ---------------- NEW: CPU Load Averages (additive) ----------------
+def ssh_get_load_averages() -> Optional[dict]:
+    """
+    Returns a dict:
+      {
+        "l1": float, "l5": float, "l15": float,
+        "running": int, "total": int,
+        "uptime": str
+      }
+    or None if SSH is unavailable.
+    """
+    client = _ssh_connect()
+    if client is None:
+        return None
+    try:
+        # Read loadavg (1/5/15 min + running/total processes) and human uptime
+        cmd = "bash -lc 'cat /proc/loadavg; uptime -p'"
+        out_lines = _ssh_exec(client, cmd).strip().splitlines()
+        if not out_lines:
+            return None
+
+        # /proc/loadavg format: "0.21 1.08 1.08 1/230 12345"
+        la_parts = out_lines[0].split()
+        if len(la_parts) < 4:
+            return None
+
+        l1 = float(la_parts[0])
+        l5 = float(la_parts[1])
+        l15 = float(la_parts[2])
+
+        # "1/230" => running / total processes
+        running, total = 0, 0
+        try:
+            running, total = [int(x) for x in la_parts[3].split("/", 1)]
+        except Exception:
+            pass
+
+        # uptime -p prints: "up 23 days, 3 hours, 49 minutes"
+        uptime_line = out_lines[1].strip() if len(out_lines) > 1 else ""
+        uptime = uptime_line.replace("up ", "") if uptime_line.startswith("up ") else uptime_line
+
+        return {
+            "l1": l1, "l5": l5, "l15": l15,
+            "running": running, "total": total,
+            "uptime": uptime or ""
+        }
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+def ssh_get_top_processes(max_rows: int = 5) -> dict:
+    result = {"cpu": [], "memory": [], "disk": []}
+    client = _ssh_connect()
+    if client is None:
+        return {
+            "cpu": [],
+            "memory": [],
+            "disk": [{"pid": "", "command": "SSH not configured or unavailable", "kb_rd_s": "", "kb_wr_s": ""}],
+        }
+    try:
+        cmd_cpu = f"bash -lc \"ps -eo pid,comm,pcpu --sort=-pcpu | awk 'NR==1 || NR<={max_rows+1}'\""
+        out_cpu = _ssh_exec(client, cmd_cpu)
+        rows_cpu = _parse_ps_table(out_cpu, expect_cols=3)
+        for r in rows_cpu[:max_rows]:
+            pid, comm, pcpu = r
+            result["cpu"].append({"pid": pid, "command": comm, "cpu_pct": pcpu})
+
+        cmd_mem = f"bash -lc \"ps -eo pid,comm,pmem,rss --sort=-pmem | awk 'NR==1 || NR<={max_rows+1}'\""
+        out_mem = _ssh_exec(client, cmd_mem)
+        rows_mem = _parse_ps_table(out_mem, expect_cols=4)
+        for r in rows_mem[:max_rows]:
+            pid, comm, pmem, rss = r
+            result["memory"].append({"pid": pid, "command": comm, "mem_pct": pmem, "rss_kb": rss})
+
+        sudo_prefix = "sudo -n " if VM_SSH_USE_SUDO else ""
+        cmd_disk = (
+            "bash -lc '"
+            "if command -v pidstat >/dev/null 2>&1; then "
+            "  pidstat -d 1 1 | awk \"NR<=20\"; "
+            "elif command -v iotop >/dev/null 2>&1; then "
+            f"  {sudo_prefix}iotop -b -n 1 -o | awk \"NR<=10\"; "
+            "else echo \"pidstat/iotop not available\"; fi'"
+        )
+        out_disk = _ssh_exec(client, cmd_disk)
+        disk_rows = []
+        if "pidstat" in out_disk or "UID" in out_disk or "Command" in out_disk:
+            for line in out_disk.splitlines():
+                line = line.strip()
+                if not line or line.startswith(("Linux", "Time")): continue
+                if line.lower().startswith(("pid", "average")): continue
+                parts = line.split()
+                if len(parts) >= 4 and parts[0].isdigit():
+                    pid = parts[0]
+                    try:
+                        kb_rd_s = parts[1].replace(",", "")
+                        kb_wr_s = parts[2].replace(",", "")
+                    except Exception:
+                        kb_rd_s, kb_wr_s = "", ""
+                    command = " ".join(parts[3:])
+                    disk_rows.append({"pid": pid, "command": command, "kb_rd_s": kb_rd_s, "kb_wr_s": kb_wr_s})
+            disk_rows = disk_rows[:max_rows]
+        elif "iotop" in out_disk or "Total DISK" in out_disk or "K/s" in out_disk:
+            for line in out_disk.splitlines():
+                line = line.strip()
+                if not line or "Total DISK" in line or line.startswith(("PID", "TID")): continue
+                parts = line.split()
+                if parts and parts[0].isdigit():
+                    pid = parts[0]
+                    command = line
+                    kb_rd_s, kb_wr_s = "", ""
+                    try:
+                        tokens = [p for p in parts if p.endswith("K/s") or p.endswith("M/s")]
+                        if len(tokens) >= 2:
+                            kb_rd_s, kb_wr_s = tokens[0], tokens[1]
+                    except Exception:
+                        pass
+                    disk_rows.append({"pid": pid, "command": command, "kb_rd_s": kb_rd_s, "kb_wr_s": kb_wr_s})
+            disk_rows = disk_rows[:max_rows]
+        else:
+            disk_rows = [{"pid": "", "command": "pidstat/iotop not available", "kb_rd_s": "", "kb_wr_s": ""}]
+        result["disk"] = disk_rows or [{"pid": "", "command": "No disk data", "kb_rd_s": "", "kb_wr_s": ""}]
+    except Exception as e:
+        result["disk"] = [{"pid": "", "command": f"SSH error: {e}", "kb_rd_s": "", "kb_wr_s": ""}]
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+    return result
+
+def build_top_processes_html(top: dict) -> str:
+    def render_cpu():
+        rows = top.get("cpu", [])
+        if not rows:
+            return "<p style='color:#6b7280;'>No CPU process data</p>"
+        out = []
+        out.append(
+            "<table width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse; background:#ffffff; border:1px solid #e5e7eb;' bgcolor='#ffffff'>"
+            "<thead><tr style='background:#f3f4f6;' bgcolor='#f3f4f6'>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>PID</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>Command</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>CPU %</th>"
+            "</tr></thead><tbody>"
+        )
+        for r in rows:
+            out.append(
+                "<tr>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(r.get('pid',''))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(r.get('command',''))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(str(r.get('cpu_pct','')))}</td>"
+                "</tr>"
+            )
+        out.append("</tbody></table>")
+        return "".join(out)
+
+    def render_mem():
+        rows = top.get("memory", [])
+        if not rows:
+            return "<p style='color:#6b7280;'>No Memory process data</p>"
+        out = []
+        out.append(
+            "<table width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse; background:#ffffff; border:1px solid #e5e7eb;' bgcolor='#ffffff'>"
+            "<thead><tr style='background:#f3f4f6;' bgcolor='#f3f4f6'>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>PID</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>Command</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>Mem %</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>RSS</th>"
+            "</tr></thead><tbody>"
+        )
+        for r in rows:
+            rss_kb = r.get("rss_kb")
+            rss_str = human_bytes(float(rss_kb) * 1024) if rss_kb and str(rss_kb).isdigit() else str(rss_kb or "")
+            out.append(
+                "<tr>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(r.get('pid',''))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(r.get('command',''))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(str(r.get('mem_pct','')))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(rss_str)}</td>"
+                "</tr>"
+            )
+        out.append("</tbody></table>")
+        return "".join(out)
+
+    def render_disk():
+        rows = top.get("disk", [])
+        if not rows:
+            return "<p style='color:#6b7280;'>No Disk I/O process data</p>"
+        out = []
+        out.append(
+            "<table width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse; background:#ffffff; border:1px solid #e5e7eb;' bgcolor='#ffffff'>"
+            "<thead><tr style='background:#f3f4f6;' bgcolor='#f3f4f6'>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>PID</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>Command</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>kB read/s</th>"
+            "<th style='padding:8px 10px; color:#111827; font-size:13px; border-bottom:1px solid #e5e7eb;' align='left'>kB write/s</th>"
+            "</tr></thead><tbody>"
+        )
+        for r in rows:
+            out.append(
+                "<tr>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(r.get('pid',''))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(r.get('command',''))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(str(r.get('kb_rd_s','')))}</td>"
+                f"<td style='padding:8px 10px; border-bottom:1px solid #e5e7eb; color:#111827;'>{html_escape(str(r.get('kb_wr_s','')))}</td>"
+                "</tr>"
+            )
+        out.append("</tbody></table>")
+        return "".join(out)
+
     return (
-        "<table class='summary' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
-        "<thead><tr>"
-        "<th>PID</th><th>Name</th><th>User</th><th>RSS</th><th>CPU %</th>"
-        "</tr></thead><tbody>" + "".join(tr) + "</tbody></table>"
+        "<div style='margin:10px 0;'>"
+        "<h4 style='margin:0 0 8px; color:#1f2937;'>Top Processes on VM (via SSH)</h4>"
+        "<h5 style='margin:10px 0 6px; color:#374151;'>CPU</h5>" + render_cpu() +
+        "<h5 style='margin:14px 0 6px; color:#374151;'>Memory</h5>" + render_mem() +
+        "<h5 style='margin:14px 0 6px; color:#374151;'>Disk I/O</h5>" + render_disk() +
+        "</div>"
     )
 
-def html_table_top_io(rows: List[Dict[str, Any]]) -> str:
-    if not rows:
-        return "<p>No process data available.</p>"
-    tr = []
-    for r in rows:
-        tr.append(
-            "<tr>"
-            f"<td>{r.get('PID','')}</td>"
-            f"<td>{html.escape(str(r.get('Process','')))}</td>"
-            f"<td style='text-align:right'>{human_bytes(float(r.get('ReadBps',0.0)))}/s</td>"
-            f"<td style='text-align:right'>{human_bytes(float(r.get('WriteBps',0.0)))}/s</td>"
-            f"<td style='text-align:right'>{human_bytes(float(r.get('TotalBps',0.0)))}/s</td>"
-            "</tr>"
+# ---------------- AI Analysis renderer (Styled Cards) ----------------
+def render_ai_analysis_html(summary_text: str) -> str:
+    """
+    Converts Agent's plain text SRE Incident Report into light-themed HTML cards with headings + bullet lists.
+    """
+    if not summary_text:
+        return "<div style='color:#6b7280;'>No AI analysis available.</div>"
+
+    lines = [l.rstrip() for l in summary_text.splitlines()]
+    sections = {}
+    current = None
+    buffer: List[str] = []
+
+    def flush():
+        nonlocal current, buffer
+        if current:
+            sections[current] = buffer[:]
+        buffer.clear()
+
+    # detect known headings
+    headings = {
+        "Summary:": "Summary",
+        "Forecast:": "Forecast",
+        "Status:": "Status",
+        "Top Findings:": "Top Findings",
+        "Immediate Actions (Runbook):": "Immediate Actions",
+        "Diagnostics to Run (Linux):": "Diagnostics",
+        "Mitigations:": "Mitigations",
+        "Follow-up / Prevention:": "Follow-up / Prevention",
+    }
+
+    for raw in lines:
+        if raw.strip() in headings.keys():
+            flush()
+            current = headings[raw.strip()]
+        else:
+            buffer.append(raw)
+    flush()
+
+    def render_list(items: List[str]) -> str:
+        lis = []
+        for x in items:
+            x = x.strip()
+            if not x:
+                continue
+            if x.startswith(("-", "•")):
+                x = x.lstrip("-• ").strip()
+            lis.append(f"<li style='margin:6px 0; color:#111827;'>{html_escape(x)}</li>")
+        return "<ul style='margin:8px 0 0 18px; padding:0;'>{}</ul>".format("".join(lis)) if lis else "<div class='muted' style='color:#6b7280;'>No data.</div>"
+
+    def card(title: str, items: List[str]) -> str:
+        return (
+            "<div style='margin:10px 0; background:#ffffff; border:1px solid #e5e7eb; border-radius:8px; padding:12px;' bgcolor='#ffffff'>"
+            f"<div style='font-weight:600; color:#1f2937; margin-bottom:6px;'>{html_escape(title)}</div>"
+            f"{render_list(items)}"
+            "</div>"
         )
-    return (
-        "<table class='summary' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;'>"
-        "<thead><tr>"
-        "<th>PID</th><th>Name</th><th>Read</th><th>Write</th><th>Total</th>"
-        "</tr></thead><tbody>" + "".join(tr) + "</tbody></table>"
-    )
+
+    html = ["<div>"]
+    for t in ["Summary", "Forecast", "Status", "Top Findings", "Immediate Actions", "Diagnostics", "Mitigations", "Follow-up / Prevention"]:
+        if t in sections:
+            html.append(card(t, sections[t]))
+    html.append("</div>")
+    return "".join(html)
+
+# ---------------- Testing helpers ----------------
+def create_dummy_csv() -> Path:
+    p = Path("dummy_metrics.csv")
+    rows = [
+        ["timestamp", "metric", "value"],
+        ["2025-12-02T10:00:00", "Percentage CPU", 0.5],
+        ["2025-12-02T10:01:00", "Percentage CPU", 0.7],
+        ["2025-12-02T10:02:00", "Percentage CPU", 0.6],
+        ["2025-12-02T10:03:00", "Percentage CPU", 0.65],
+        ["2025-12-02T10:00:00", "Available Memory Bytes", 2450000000],
+        ["2025-12-02T10:01:00", "Available Memory Bytes", 2400000000],
+        ["2025-12-02T10:00:00", "Disk Read Bytes", 0],
+        ["2025-12-02T10:01:00", "Disk Read Bytes", 0],
+        ["2025-12-02T10:00:00", "Disk Write Bytes", 1248035],
+        ["2025-12-02T10:01:00", "Disk Write Bytes", 1248035],
+    ]
+    with open(p, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerows(rows)
+    return p
+
+def load_dummy_rows_from_csv(path: Path) -> List[List]:
+    df = pd.read_csv(path)
+    rows = []
+    for _, r in df.iterrows():
+        rows.append([r["timestamp"], r["metric"], float(r["value"])])
+    return rows
 
 # ---------------- Main alert workflow ----------------
-def process_health_alert(
-    metrics: dict,
-    health: dict,
-    cpu_threshold: float,
-    disk_threshold: float,
-    mem_threshold: float,
-    df_micro: pd.DataFrame,
-    cpu_line_chart: Optional[Path],
-    docker_rows: Optional[List[Dict[str,Any]]] = None
-) -> bool:
-    print("=" * 70)
-    print(f"{ICONS['gear']} Processing system health alert (Remote SSH)...")
-    print("=" * 70)
+def process_cycle(rows: List[List], agent_client: Optional[AgentsClient] = None) -> bool:
+    print("\n==============================")
+    print("➡ Starting alert processing...")
+    print("==============================")
 
-    # Charts
-    charts: List[Path] = []
-    pie_chart = generate_pie_chart(metrics.get("cpu_percent", 0.0), metrics.get("disk_percent"), metrics.get("memory_percent"), f"health_pies_{int(time.time())}.png")
-    charts.append(pie_chart)
-    if cpu_line_chart:
-        charts.append(cpu_line_chart)
+    df = rows_to_df(rows)
 
-    # Inline base64
-    pie_data_uri = file_to_base64_datauri(pie_chart) if INLINE_CHARTS else None
-    cpu_data_uri = file_to_base64_datauri(cpu_line_chart) if (INLINE_CHARTS and cpu_line_chart) else None
-
-    # AI Analysis (Cloud)
-    ai_analysis = run_cloud_ai_mandatory(df_micro)
-
-    # Severity classification
-    cpu_alert = metrics.get("cpu_percent") is not None and metrics["cpu_percent"] > cpu_threshold
-    disk_alert = metrics.get("disk_percent") is not None and metrics["disk_percent"] > disk_threshold
-    mem_alert  = metrics.get("memory_percent") is not None and metrics["memory_percent"] > mem_threshold
-
-    cpu_sev = classify_severity(metrics.get("cpu_percent", 0.0), cpu_threshold) if cpu_alert else None
-    disk_sev = classify_severity(metrics.get("disk_percent", 0.0), disk_threshold) if disk_alert else None
-    mem_sev  = classify_severity(metrics.get("memory_percent", 0.0), mem_threshold)  if mem_alert  else None
-    overall  = overall_severity(cpu_sev, disk_sev, mem_sev) or "Info"
-
-    # Top processes from VM
-    top_cpu = metrics.get("top_cpu", []) if cpu_alert else []
-    top_mem = metrics.get("top_mem", []) if mem_alert else []
-    top_io  = metrics.get("top_io", [])  if disk_alert else []
-
-    # Docker HTML
-    docker_html = render_docker_html(docker_rows or [])
-
-    # Build CSVs
-    alert_csv = build_alert_csv(metrics, health, cpu_threshold, disk_threshold, mem_threshold)
-    proc_csvs: List[Path] = []
-    if top_cpu: proc_csvs.append(save_top_csv("top_cpu", top_cpu, ["Computer","PID","Process","User","CPUPercent","RSSBytes"]))
-    if top_mem: proc_csvs.append(save_top_csv("top_mem", top_mem, ["Computer","PID","Process","User","RSSBytes","CPUPercent"]))
-    if top_io:  proc_csvs.append(save_top_csv("top_disk_io", top_io, ["Computer","PID","Process","ReadBps","WriteBps","TotalBps"]))
-    docker_csv = save_docker_csv(docker_rows or [])
-    if docker_csv: proc_csvs.append(docker_csv)
-
-    # Process tables (HTML)
-    cpu_section = "<h3>Top 5 CPU Processes</h3>" + html_table_top_cpu(top_cpu) if cpu_alert else ""
-    mem_section = "<h3>Top 5 Memory Processes</h3>" + html_table_top_mem(top_mem) if mem_alert else ""
-    disk_section = (
-        "<h3>Top 5 Disk I/O Processes</h3>"
-        f"<p style='color:#555'>Sorted by total bytes/sec (read+write). Sampling window ~{SAMPLE_SEC:.1f}s.</p>"
-        + html_table_top_io(top_io)
-    ) if disk_alert else ""
-
-    # Alerts list
-    if health["alerts"]:
-        alerts_html = "<ul>" + "".join(f"<li style='color:#D32F2F'><strong>{html.escape(a)}</strong></li>" for a in health["alerts"]) + "</ul>"
-    else:
-        alerts_html = "<p style='color:#388E3C'>No alerts</p>"
-
-    print("➡ Building HTML email body...")
-    now = utc_iso_now()
-    subject = build_alert_subject(metrics, cpu_threshold, disk_threshold, mem_threshold)
-
-    # CID logo setup
-    
-
-# ---------------- Branding (CID Logo) ----------------
-
-
-# ---------------- Branding (CID Logo) ----------------
-    cid_images: list[tuple[str, Path]] = []
-    logo_cid = "company_logo"
-
-    # Header: keep text fallback only (no logo in header)
-    header_brand_tag = '<span style="font-weight:600">SkynetOps Monitoring</span>'
-
-    # Footer: start empty; fill only if logo is resolved
-    footer_logo_tag = ""
-
-    logo_path = resolve_logo_path(COMPANY_LOGO_PATH)
-    if logo_path and logo_path.exists():
-        cid_images.append((logo_cid, logo_path))
-        # ✅ Footer logo image tag (CID)
-        footer_logo_tag = (
-            f'<img src="cid:{logo_cid}" alt="Company Logo" '
-            f'style="height:28px; vertical-align:middle; display:inline-block;" />'
+    print("➡ Extracting latest CPU, Memory, Disk values...")
+    cpu_latest = None
+    if not df.empty and "Percentage CPU" in df["metric"].unique():
+        cpu_latest = float(
+            df.loc[df["metric"] == "Percentage CPU"].sort_values("timestamp")["value"].iloc[-1]
         )
 
+    ssh_cpu = ssh_get_overall_cpu()
+    if ssh_cpu is not None:
+        print(f"   (SSH) VM CPU current = {ssh_cpu}%")
+        cpu_latest = ssh_cpu
 
-    body_html = f"""
-<html>
-<head>
-<meta charset="utf-8" />
-<style>
-  body {{
-    margin:0; padding:0; background-color:#f4f6f8;
-    font-family:Segoe UI, Arial, sans-serif; color:#1f2933;
-  }}
-  .card {{
-    background:#ffffff; border-radius:8px;
-    box-shadow:0 2px 10px rgba(0,0,0,0.08);
-  }}
-  .muted {{ color:#6b7280; }}
-  .danger {{ color:#b91c1c; }}
-  table.summary th, table.summary td {{
-    border:1px solid #e5e7eb; font-size:14px; padding:8px;
-  }}
-  table.summary thead tr {{ background:#f9fafb; }}
-  pre.block {{
-    background:#f9fafb; border:1px solid #e5e7eb;
-    padding:14px; border-radius:6px; font-size:13px; white-space:pre-wrap;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ background-color:#0b0f14; color:#e5e7eb; }}
-    .card {{ background:#111827; box-shadow:none; }}
-    .muted {{ color:#9aa4b2; }}
-    .danger {{ color:#f87171; }}
-    table.summary th, table.summary td {{ border-color:#334155; }}
-    table.summary thead tr {{ background:#1f2937; }}
-    pre.block {{ background:#1f2937; border-color:#334155; }}
-  }}
-</style>
-</head>
-<body>
+    mem_pct_free = None
+    mem_total_bytes = TOTAL_MEMORY_BYTES if TOTAL_MEMORY_BYTES > 0 else None
+    mem_available_bytes_latest = None
 
-<table width="100%" cellpadding="0" cellspacing="0">
-<tr><td align="center" style="padding:24px 0;">
+    if ("Available Memory Bytes" in df["metric"].unique()) and (mem_total_bytes is not None):
+        mem_bytes = float(
+            df.loc[df["metric"] == "Available Memory Bytes"]
+            .sort_values("timestamp")["value"]
+            .iloc[-1]
+        )
+        mem_available_bytes_latest = mem_bytes
+        mem_pct_free = (mem_bytes / mem_total_bytes) * 100.0
+    else:
+        ssh_total, ssh_available = ssh_get_memory_info()
+        if ssh_total is not None and ssh_available is not None:
+            mem_total_bytes = ssh_total
+            mem_available_bytes_latest = ssh_available
+            mem_pct_free = (ssh_available / ssh_total) * 100.0
 
-<table width="900" cellpadding="0" cellspacing="0" class="card">
+    disk_read_latest = None
+    disk_write_latest = None
+    if "Disk Read Bytes" in df["metric"].unique():
+        disk_read_latest = float(
+            df.loc[df["metric"] == "Disk Read Bytes"]
+            .sort_values("timestamp")["value"]
+            .iloc[-1]
+        )
+    if "Disk Write Bytes" in df["metric"].unique():
+        disk_write_latest = float(
+            df.loc[df["metric"] == "Disk Write Bytes"]
+            .sort_values("timestamp")["value"]
+            .iloc[-1]
+        )
 
+    print(f"   CPU latest = {cpu_latest}")
+    print(f"   Memory free % = {mem_pct_free}")
+    print(f"   Disk Read Bytes latest = {disk_read_latest}")
+    print(f"   Disk Write Bytes latest = {disk_write_latest}")
 
-<!-- Header -->
-<tr><td style="padding:20px 30px; border-bottom:1px solid #e5e7eb;">
-  <table width="100%"><tr>
-    <td align="left" style="font-size:18px; font-weight:600; color:#111827;">
-      {header_brand_tag}
-    </td>
-    <td align="right" class="muted" style="font-size:13px;">
-      System Health Alert — {overall}
-    </td>
-  </tr></table>
-</td></tr>
+    print("➡ Running analytics (min/max/avg/anomaly/forecast)...")
+    stats_cpu = compute_summary_stats(df, "Percentage CPU", drop_zeros=True)
+    stats_mem = compute_summary_stats(df, "Available Memory Bytes")
+    stats_disk_read = compute_summary_stats(df, "Disk Read Bytes")
+    stats_disk_write = compute_summary_stats(df, "Disk Write Bytes")
 
+    cpu_series = (
+        df.loc[df["metric"] == "Percentage CPU"]
+        .sort_values("timestamp")["value"]
+        .astype(float)
+        .replace(0.0, np.nan)
+        .dropna()
+    )
+    disk_read_series = df.loc[df["metric"] == "Disk Read Bytes"].sort_values("timestamp")["value"]
+    disk_write_series = df.loc[df["metric"] == "Disk Write Bytes"].sort_values("timestamp")["value"]
 
-<!-- Title -->
-<tr><td style="padding:25px 30px;">
-  <h2 class="danger" style="margin:0;">{'🚨 ' if USE_EMOJI else ''}Alert Detected</h2>
-  <p style="margin:8px 0 0;">One or more system metrics have exceeded configured thresholds.</p>
-  <p class="muted" style="margin-top:6px; font-size:13px;">
-    <strong>Timestamp (UTC):</strong> {now}
-  </p>
-</td></tr>
+    cpu_anomalies = detect_anomalies_zscore(cpu_series)
+    disk_read_anomalies = detect_anomalies_zscore(disk_read_series)
+    disk_write_anomalies = detect_anomalies_zscore(disk_write_series)
 
-<!-- Summary Table -->
-<tr><td style="padding:0 30px 20px;">
-  <h3 style="margin-bottom:10px;">Alert Summary</h3>
+    forecasts = simple_linear_forecast(cpu_series, steps=3)
+    print("   ✔ Analytics completed")
 
-  <table class="summary" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-    <thead>
+    print("➡ Building CSV files...")
+    ctx_csv_name = f"alert_ctx_{int(time.time())}.csv"
+    ctx_path = save_csv(rows, ctx_csv_name)
+    failed_csv = build_failed_csv(cpu_latest, mem_pct_free)
+    print("   ✔ CSV files created")
+
+    print("➡ Generating charts...")
+    cpu_line = generate_line_chart(df, "Percentage CPU", f"cpu_line_{int(time.time())}.png")
+    mem_line = generate_line_chart(df, "Available Memory Bytes", f"mem_line_{int(time.time())}.png")
+    disk_read_line = generate_line_chart(df, "Disk Read Bytes", f"disk_read_{int(time.time())}.png")
+    disk_write_line = generate_line_chart(df, "Disk Write Bytes", f"disk_write_{int(time.time())}.png")
+    pie = generate_pie_chart(cpu_latest or 0.0, f"cpu_pie_{int(time.time())}.png")
+    print("   ✔ Charts created")
+
+    summary_text = ""
+    if agent_client and PROJECT_ENDPOINT and MODEL_DEPLOYMENT:
+        print("➡ Running Azure AI Agent (may take time)...")
+        try:
+            summary_text = run_agent_analysis_direct(agent_client, df)
+            print("   ✔ Agent analysis finished")
+        except Exception as e:
+            print("   ⚠ Agent error:", e)
+            summary_text = f"⚠ Agent analysis failed: {e}"
+    else:
+        print("➡ AI Agent disabled (no endpoint/model in .env)")
+        summary_text = "AI Agent disabled (missing PROJECT_ENDPOINT or MODEL_DEPLOYMENT)."
+
+    print("➡ Collecting top processes via SSH (CPU/Mem/Disk)...")
+    try:
+        top = ssh_get_top_processes(max_rows=5)
+        top_html_block = build_top_processes_html(top)
+        print("   ✔ Top processes collected")
+    except Exception as e:
+        print("   ⚠ SSH top processes error:", e)
+        top_html_block = f"<p>⚠ SSH top processes error: {html_escape(str(e))}</p>"
+
+    # --- NEW: CPU Load Average description (light theme card) ---
+    loadavg = None
+    try:
+        loadavg = ssh_get_load_averages()
+    except Exception:
+        loadavg = None
+
+    if loadavg:
+        load_desc_html = (
+            f"<div style='font-size:13px; color:#374151;'>"
+            f"<strong>Load average:</strong> {loadavg['l1']:.2f} {loadavg['l5']:.2f} {loadavg['l15']:.2f} "
+            f"&nbsp;|&nbsp; <strong>Uptime:</strong> {html_escape(loadavg['uptime'])} "
+            f"&nbsp;|&nbsp; <strong>Tasks:</strong> {loadavg['running']}/{loadavg['total']} running"
+            f"</div>"
+        )
+    else:
+        load_desc_html = (
+            "<div style='font-size:13px; color:#6b7280;'>"
+            "<strong>Load average:</strong> N/A (SSH not configured or unavailable)"
+            "</div>"
+        )
+
+    # Human-readable stats
+    cpu_min_str = f"{stats_cpu['min']:0.2f} %" if stats_cpu["min"] is not None else "N/A"
+    cpu_max_str = f"{stats_cpu['max']:0.2f} %" if stats_cpu["max"] is not None else "N/A"
+    cpu_avg_str = f"{stats_cpu['avg']:0.2f} %" if stats_cpu['avg'] is not None else "N/A"
+    mem_min_str = human_bytes(stats_mem["min"]) if stats_mem["min"] is not None else "N/A"
+    mem_max_str = human_bytes(stats_mem["max"]) if stats_mem["max"] is not None else "N/A"
+    mem_avg_str = human_bytes(stats_mem["avg"]) if stats_mem["avg"] is not None else "N/A"
+    disk_read_min_str = human_bytes(stats_disk_read["min"]) if stats_disk_read["min"] is not None else "N/A"
+    disk_read_max_str = human_bytes(stats_disk_read["max"]) if stats_disk_read["max"] is not None else "N/A"
+    disk_read_avg_str = human_bytes(stats_disk_read["avg"]) if stats_disk_read["avg"] is not None else "N/A"
+    disk_write_min_str = human_bytes(stats_disk_write["min"]) if stats_disk_write["min"] is not None else "N/A"
+    disk_write_max_str = human_bytes(stats_disk_write["max"]) if stats_disk_write["max"] is not None else "N/A"
+    disk_write_avg_str = human_bytes(stats_disk_write["avg"]) if stats_disk_write["avg"] is not None else "N/A"
+
+    cpu_forecast_15m = f"{forecasts[0]:0.2f}" if len(forecasts) > 0 else "0.00"
+    cpu_forecast_30m = f"{forecasts[1]:0.2f}" if len(forecasts) > 1 else "0.00"
+    cpu_forecast_60m = f"{forecasts[2]:0.2f}" if len(forecasts) > 2 else "0.00"
+
+    # Summary metrics (usage)
+    memory_percent = None
+    if mem_pct_free is not None:
+        memory_percent = 100.0 - mem_pct_free
+    metrics = {
+        "cpu_percent": float(cpu_latest) if cpu_latest is not None else float("nan"),
+        "memory_percent": float(memory_percent) if memory_percent is not None else float("nan"),
+        "disk_percent": float("nan"),  # populate if you have disk capacity %
+    }
+    cpu_threshold = CPU_THRESHOLD
+    mem_threshold = MEMORY_THRESHOLD if MEMORY_THRESHOLD > 0 else (100.0 - MEM_FREE_PCT_THRESHOLD)
+    disk_threshold = DISK_THRESHOLD
+
+    cpu_status, cpu_sev = compute_status_and_severity(metrics["cpu_percent"], cpu_threshold)
+    mem_status, mem_sev = compute_status_and_severity(metrics["memory_percent"], mem_threshold) if not np.isnan(metrics["memory_percent"]) else ("Unknown", None)
+    disk_status, disk_sev = compute_status_and_severity(metrics["disk_percent"], disk_threshold) if not np.isnan(metrics["disk_percent"]) else ("Unknown", None)
+    health = {"cpu_status": cpu_status, "memory_status": mem_status, "disk_status": disk_status}
+    overall = aggregate_overall(cpu_status, mem_status, disk_status)
+
+    anomaly_counts = {
+        "cpu": int(cpu_anomalies.sum()) if hasattr(cpu_anomalies, "sum") else 0,
+        "disk_read": int(disk_read_anomalies.sum()) if hasattr(disk_read_anomalies, "sum") else 0,
+        "disk_write": int(disk_write_anomalies.sum()) if hasattr(disk_write_anomalies, "sum") else 0,
+    }
+    thresholds = {"cpu": cpu_threshold, "mem": mem_threshold, "disk": disk_threshold}
+    triggered_alerts = build_triggered_alerts(metrics, thresholds, anomaly_counts)
+    alerts_html = render_alerts_html(triggered_alerts)
+
+    # Styled AI analysis
+    ai_html = render_ai_analysis_html(summary_text)
+
+    # ---------- Light Theme HTML ----------
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    subject = f"SkynetOps Alert on {VM_NAME or 'VM'} — {overall}"
+    emoji_prefix = "🚨 " if USE_EMOJI else ""
+    header_brand_tag = f"<span>SkynetOps • {html_escape(VM_NAME or 'VM')}</span>"
+
+    cpu_current_str = f"{metrics['cpu_percent']:.2f}%" if not np.isnan(metrics['cpu_percent']) else "N/A"
+    mem_current_str = f"{metrics['memory_percent']:.2f}%" if not np.isnan(metrics.get('memory_percent', float('nan'))) else "N/A"
+    disk_current_str = f"{metrics['disk_percent']:.2f}%" if not np.isnan(metrics.get('disk_percent', float('nan'))) else "N/A"
+    cpu_threshold_str = f"{cpu_threshold:.2f}%"
+    mem_threshold_str = f"{mem_threshold:.2f}%"
+    disk_threshold_str = f"{disk_threshold:.2f}%"
+
+    # Inline charts (optional) CIDs
+    inline_cids: Dict[str, Path] = {}
+    if COMPANY_LOGO_PATH:
+        inline_cids["company_logo"] = Path(COMPANY_LOGO_PATH)
+    if INLINE_CHARTS:
+        inline_cids["chart_cpu_line"] = cpu_line
+        inline_cids["chart_mem_line"] = mem_line
+        inline_cids["chart_disk_read_line"] = disk_read_line
+        inline_cids["chart_disk_write_line"] = disk_write_line
+        inline_cids["chart_cpu_pie"] = pie
+
+    body_html = f"""\
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="x-ua-compatible" content="ie=edge" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>SkynetOps Alert</title>
+  </head>
+  <body style="margin:0; padding:0; background:#f8fafc; color:#111827;" bgcolor="#f8fafc">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8fafc;" bgcolor="#f8fafc">
       <tr>
-        <th align="left">Metric</th>
-        <th align="left">Current</th>
-        <th align="left">Threshold</th>
-        <th align="left">Status</th>
-        <th align="left">Severity</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>CPU Usage</td>
-        <td>{metrics.get('cpu_percent', 0.0):.2f}%</td>
-        <td>{cpu_threshold}%</td>
-        <td>{health['cpu_status']}</td>
-        <td>{cpu_sev or '-'}</td>
-      </tr>
-      <tr>
-        <td>Disk Usage</td>
-        <td>{f"{metrics['disk_percent']:.2f}%" if metrics.get('disk_percent') is not None else "N/A"}</td>
-        <td>{disk_threshold}%</td>
-        <td>{health['disk_status']}</td>
-        <td>{disk_sev or '-'}</td>
-      </tr>
-      <tr>
-        <td>Memory Usage</td>
-        <td>{metrics.get('memory_percent', float('nan')):.2f}%</td>
-        <td>{mem_threshold}%</td>
-        <td>{health['memory_status']}</td>
-        <td>{mem_sev or '-'}</td>
-      </tr>
-    </tbody>
-  </table>
-</td></tr>
+        <td align="center" style="padding:24px 12px;" bgcolor="#f8fafc">
+          <table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0" style="width:640px; max-width:640px; background:#ffffff; border-radius:12px; overflow:hidden; border:1px solid #e5e7eb;" bgcolor="#ffffff">
+            <!-- Header -->
+            <tr>
+              <td style="padding:20px 30px; border-bottom:1px solid #e5e7eb; background:#f9fafb;" bgcolor="#f9fafb">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                  <tr>
+                    <td align="left" style="font-size:18px; font-weight:600; color:#1f2937;">
+                      {header_brand_tag}
+                    </td>
+                    <td align="right" style="font-size:13px; color:#374151;">
+                      System Health Alert — {overall}
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
 
-<!-- Visuals (stacked one-by-one) -->
-<tr><td style="padding:0 30px 10px;">
-  <h3>Visuals</h3>
+            <!-- Title -->
+            <tr>
+              <td style="padding:25px 30px;" bgcolor="#ffffff">
+                <h2 style="margin:0; font-size:22px; line-height:1.3; color:#dc2626;">
+                  {emoji_prefix}Alert Detected
+                </h2>
+                <p style="margin:10px 0 0; color:#111827;">One or more system metrics have exceeded configured thresholds.</p>
+                <p style="margin-top:6px; font-size:13px; color:#374151;">
+                  <strong>Timestamp (UTC):</strong> {now}
+                </p>
+              </td>
+            </tr>
 
-  <div style="border:1px solid #e5e7eb; border-radius:6px; padding:8px; margin-bottom:12px;">
-    <div class="muted" style="margin-bottom:6px;">Current Health (Pie)</div>
-    {('<img alt="health_pie" src="' + (pie_data_uri or '') + '" style="max-width:100%; border-radius:4px;" />') if pie_data_uri else '<p class="muted">No chart</p>'}
-  </div>
+            <!-- CPU Load Average (description) -->
+            <tr>
+              <td style="padding:0 30px 22px;" bgcolor="#ffffff">
+                <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:8px; padding:12px;" bgcolor="#ffffff">
+                  {load_desc_html}
+                </div>
+              </td>
+            </tr>
 
-  <div style="border:1px solid #e5e7eb; border-radius:6px; padding:8px; margin-bottom:12px;">
-    <div class="muted" style="margin-bottom:6px;">Azure VM CPU (Last {FAST_LOOKBACK_MIN}m)</div>
-    {('<img alt="azure_cpu" src="' + (cpu_data_uri or '') + '" style="max-width:100%; border-radius:4px;" />') if cpu_data_uri else '<p class="muted">No Azure CPU data</p>'}
-  </div>
-</td></tr>
+            <!-- Summary Table -->
+            <tr>
+              <td style="padding:0 30px 22px;" bgcolor="#ffffff">
+                <h3 style="margin:0 0 10px; font-size:18px; color:#1f2937;">Alert Summary</h3>
+                <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; background:#ffffff; border:1px solid #e5e7eb;" bgcolor="#ffffff">
+                  <thead>
+                    <tr style="background:#f3f4f6;" bgcolor="#f3f4f6">
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Metric</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Current</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Threshold</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Status</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Severity</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">CPU Usage</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{cpu_current_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{cpu_threshold_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{health['cpu_status']}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#b91c1c;">{cpu_sev or '-'}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">Disk Usage</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{disk_current_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{disk_threshold_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{health['disk_status']}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#b91c1c;">{disk_sev or '-'}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:10px 12px; color:#111827;">Memory Usage</td>
+                      <td style="padding:10px 12px; color:#111827;">{mem_current_str}</td>
+                      <td style="padding:10px 12px; color:#111827;">{mem_threshold_str}</td>
+                      <td style="padding:10px 12px; color:#111827;">{health['memory_status']}</td>
+                      <td style="padding:10px 12px; color:#b91c1c;">{mem_sev or '-'}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </td>
+            </tr>
 
-<!-- Alerts -->
-<tr><td style="padding:0 30px 20px;">
-  <h3>Triggered Alerts</h3>
-  {alerts_html}
-</td></tr>
+            <!-- Triggered Alerts -->
+            <tr>
+              <td style="padding:0 30px 22px;" bgcolor="#ffffff">
+                <h3 style="margin:0 0 10px; font-size:18px; color:#1f2937;">Triggered Alerts</h3>
+                <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:8px; padding:12px;" bgcolor="#ffffff">
+                  {alerts_html}
+                </div>
+              </td>
+            </tr>
 
-<!-- Docker Summary -->
-<tr><td style="padding:0 30px 20px;">
-  {docker_html}
-</td></tr>
+            <!-- Analytics -->
+            <tr>
+              <td style="padding:0 30px 22px;" bgcolor="#ffffff">
+                <h3 style="margin:0 0 10px; font-size:18px; color:#1f2937;">Analytics</h3>
+                <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; background:#ffffff; border:1px solid #e5e7eb;" bgcolor="#ffffff">
+                  <thead>
+                    <tr style="background:#f3f4f6;" bgcolor="#f3f4f6">
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Series</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Min</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Max</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Avg</th>
+                      <th align="left" style="padding:10px 12px; font-size:13px; color:#111827; border-bottom:1px solid #e5e7eb;">Anomalies</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">CPU (%)</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{cpu_min_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{cpu_max_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{cpu_avg_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{anomaly_counts['cpu']}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">Disk Read (bytes)</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{disk_read_min_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{disk_read_max_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{disk_read_avg_str}</td>
+                      <td style="padding:10px 12px; border-bottom:1px solid #e5e7eb; color:#111827;">{anomaly_counts['disk_read']}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:10px 12px; color:#111827;">Disk Write (bytes)</td>
+                      <td style="padding:10px 12px; color:#111827;">{disk_write_min_str}</td>
+                      <td style="padding:10px 12px; color:#111827;">{disk_write_max_str}</td>
+                      <td style="padding:10px 12px; color:#111827;">{disk_write_avg_str}</td>
+                      <td style="padding:10px 12px; color:#111827;">{anomaly_counts['disk_write']}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div style="margin-top:10px; background:#ffffff; border:1px solid #e5e7eb; border-radius:8px; padding:12px; color:#111827;" bgcolor="#ffffff">
+                  <div style="font-size:13px;"><strong>CPU Forecasts:</strong></div>
+                  <div style="font-size:13px; color:#374151; margin-top:6px;">
+                    15m: {cpu_forecast_15m}% &nbsp;|&nbsp; 30m: {cpu_forecast_30m}% &nbsp;|&nbsp; 60m: {cpu_forecast_60m}%
+                  </div>
+                </div>
+              </td>
+            </tr>
 
-<!-- Top Processes -->
-<tr><td style="padding:0 30px 20px;">
-  {cpu_section}
-  {mem_section}
-  {disk_section}
-</td></tr>
+            <!-- Inline Charts (optional) -->
+            {"" if not INLINE_CHARTS else f'''
+            <tr>
+              <td style="padding:0 30px 22px;" bgcolor="#ffffff">
+                <h3 style="margin:0 0 10px; font-size:18px; color:#1f2937;">Charts</h3>
+                <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;" bgcolor="#ffffff">
+                  <tr>
+                    <td align="center" style="padding:8px;" bgcolor="#ffffff">
+                      <id:chart_cpu_line
+                    </td>
+                  </tr>
+                  <tr>
+                    <td align="center" style="padding:8px;" bgcolor="#ffffff">
+                      <img src="cid:chart_mem_line" alt="Memory trend" style="max-width:600px; width:100%; border:1px solid           <td align="center" style="padding:8px;" bgcolor="#ffffff">
+                      cid:chart_disk_read_line
+                    </td>
+                  </tr>
+                  <tr>
+                    <td align="center" style="padding:8px;" bgcolor="#ffffff">
+                      cid:chart_disk_write_line
+                    </td>
+                  </tr>
+                  <tr>
+                    <td align="center" style="padding:8px;" bgcolor="#ffffff">
+                      <img src="cid:chart_cpu_pie           </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            '''}
 
-<!-- AI Analysis -->
-<tr><td style="padding:0 30px 30px;">
-  <h3>AI-Driven Analysis & Recommendations</h3>
-  <pre class="block">{html.escape(ai_analysis)}</pre>
-</td></tr>
+            <!-- Top Processes (SSH) -->
+            <tr>
+              <td style="padding:0 30px 22px;" bgcolor="#ffffff">
+                <h3 style="margin:0 0 10px; font-size:18px; color:#1f2937;">Top Processes (SSH)</h3>
+                <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:8px; padding:12px;" bgcolor="#ffffff">
+                  {top_html_block}
+                </div>
+              </td>
+            </tr>
 
+            <!-- AI Analysis (Styled) -->
+            <tr>
+              <td style="padding:0 30px 22px;" bgcolor="#ffffff">
+                <h3 style="margin:0 0 10px; font-size:18px; color:#1f2937;">AI Analysis</h3>
+                {ai_html}
+              </td>
+            </tr>
 
-<!-- Footer -->
-<tr>
-  <td style="padding:14px 30px; background:#f9fafb; border-top:1px solid #e5e7eb; font-size:12px;" class="muted">
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-      <tr>
-        <!-- Left: footer text -->
-        <td align="left" style="color:#6b7280; font-size:12px; line-height:1.4;">
-          This alert was automatically generated by
-          <strong>SkynetOps Monitoring Platform</strong>.<br/>
-          Attachments include CSV reports and process details (if applicable).
-        </td>
+            <!-- Footer -->
+            <tr>
+              <td style="padding:14px 30px; background:#f9fafb; border-top:1px solid #e5e7eb; font-size:12px;" bgcolor="#f9fafb">
+                <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                  <tr>
+                    <td align="left" style="color:#374151; font-size:12px; line-height:1.5;">
+                      This alert was automatically generated by
+                      <strong style="color:#111827;">SkynetOps Monitoring Platform</strong>.<br/>
+                      Attachments include CSV reports and process details (if applicable).
+                    </td>
+                    <td align="right" style="padding-left:10px;">
+                      {"<img src=\"cid:company_logo\" alt=\"Logo\" style=\"height:24px;\">"
+                         if COMPANY_LOGO_PATH else "EY GDS"}
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
 
-        <!-- Right: company logo (CID), bottom-right -->
-        <td align="right" style="padding-left:10px;">
-          <!-- CID logo (Outlook/Gmail safe) -->
-          <img
-            src="cid:company_logo"
-            alt="Company Logo"
-            width="auto"
-            height="28"
-            style="
-              height:28px;
-              max-height:28px;
-              display:inline-block;
-              vertical-align:middle;
-              border:0;
-              outline:none;
-              text-decoration:none;
-            "
-          />
+          </table>
         </td>
       </tr>
     </table>
-  </td>
-</tr>
-</table>
-
-
-</body>
+  </body>
 </html>
 """
 
-    attachments = [alert_csv] + proc_csvs  # charts are inline (base64)
+    attachments = [failed_csv, ctx_path]
+    # keep original PNGs as attachments too
+    attachments += [cpu_line, mem_line, disk_read_line, disk_write_line, pie]
+
     print("➡ Sending email...")
-    sent = send_email_with_html(subject, body_html, attachments, cid_images=cid_images)
+    sent = send_email_with_html(subject, body_html, attachments, inline_cids=inline_cids)
+
     if sent:
-        print(f"{ICONS['ok']} EMAIL SENT SUCCESSFULLY!")
+        print("✅ EMAIL SENT SUCCESSFULLY!")
     else:
         print("❌ Email failed!")
-    print("=" * 70)
+
+    print("==============================")
+    print("➡ Alert cycle completed.")
+    print("==============================\n")
     return sent
 
-# ---------------- Threshold input ----------------
-def get_thresholds_from_user() -> Tuple[float, float, float]:
-    print("=" * 60)
-    print(" SkynetOps — Threshold Configuration (Remote SSH to Azure VM)")
-    print("=" * 60)
+# ---------------- CLI / Main ----------------
+def test_email_only() -> bool:
+    # Quick smoke test for light theme + CID logo
+    html = """<!DOCTYPE html><html><body style="background:#f8fafc; color:#111827; padding:20px;" bgcolor="#f8fafc">
+      <table width="600" style="background:#ffffff; border:1px solid #e5e7eb;" bgcolor="#ffffff" cellpadding="0" cellspacing="0">
+        <tr><td style="padding:16px; color:#111827;" bgcolor="#ffffff">
+          <h3 style="margin:0; color:#dc2626;">Light Theme Test</h3>
+          <p>Logo below should render via CID:</p>
+          <img src="cid:company_logo" alt="Logo" style="height:24pxbody></html>"""
+    inline = {}
+    if COMPANY_LOGO_PATH:
+        inline["company_logo"] = Path(COMPANY_LOGO_PATH)
+    return send_email_with_html("[SkynetOps TEST] SMTP + CID", html, [], inline_cids=inline)
+
+def test_dummy_once() -> bool:
+    p = create_dummy_csv()
+    rows = load_dummy_rows_from_csv(p)
+    agent_client: Optional[AgentsClient] = None
     try:
-        cpu_threshold = float((input(f"Enter CPU Threshold (%)[default {CPU_THRESHOLD_DEFAULT}]: ").strip() or str(CPU_THRESHOLD_DEFAULT)))
-        disk_threshold = float((input(f"Enter Disk Threshold (%)[default {DISK_THRESHOLD_DEFAULT}]: ").strip() or str(DISK_THRESHOLD_DEFAULT)))
-        mem_threshold = float((input(f"Enter Memory Threshold (%)[default {MEMORY_THRESHOLD_DEFAULT}]: ").strip() or str(MEMORY_THRESHOLD_DEFAULT)))
-        cpu_threshold = max(1, min(100, cpu_threshold))
-        disk_threshold = max(1, min(100, disk_threshold))
-        mem_threshold = max(1, min(100, mem_threshold))
-        print(f"{ICONS['ok']} Thresholds configured:")
-        print(f"   CPU   : {cpu_threshold}%")
-        print(f"   Disk  : {disk_threshold}%")
-        print(f"   Memory: {mem_threshold}%")
-        return cpu_threshold, disk_threshold, mem_threshold
-    except ValueError:
-        print(f"Invalid input. Using defaults CPU={CPU_THRESHOLD_DEFAULT}%, Disk={DISK_THRESHOLD_DEFAULT}%, Memory={MEMORY_THRESHOLD_DEFAULT}%")
-        return CPU_THRESHOLD_DEFAULT, DISK_THRESHOLD_DEFAULT, MEMORY_THRESHOLD_DEFAULT
+        agent_client = build_agents_client() if PROJECT_ENDPOINT else None
+    except Exception as e:
+        print("Agent client not available:", e)
+        agent_client = None
+    return process_cycle(rows, agent_client)
 
-# ---------------- One-time cycle ----------------
-def one_time_check(cpu_t: float, disk_t: float, mem_t: float) -> None:
-    if not VM_HOST:
-        print("❌ VM_HOST not set in .env. Please configure SSH to Azure VM.")
-        return
-    with SSHSession() as sess:
-        # Collect snapshot
-        cpu_now = sample_cpu_remote(sess, SAMPLE_SEC)
-        mem_used = mem_used_pct_remote(sess)
-        disk_used = disk_capacity_used_remote(sess, MOUNT_PATH)
+def continuous_loop() -> None:
+    agent_client: Optional[AgentsClient] = None
+    try:
+        agent_client = build_agents_client() if PROJECT_ENDPOINT else None
+    except Exception as e:
+        print("Agent client not available:", e)
+        agent_client = None
 
-        # Micro-series
-        rows: List[List] = []
-        for _ in range(max(1, FAST_SAMPLES)):
-            t = utc_iso_now()
-            c = sample_cpu_remote(sess, SAMPLE_SEC)
-            r, w = disk_bps_remote(sess, SAMPLE_SEC)
-            rows += [[t, "Percentage CPU", c], [t, "Disk Read Bytes", r], [t, "Disk Write Bytes", w]]
-        df = rows_to_df(rows)
-        cpu_line = generate_line_chart(df, "Percentage CPU", f"vm_cpu_{int(time.time())}.png")
-
-        # Top-5
-        top_cpu = top5_cpu_remote(sess)
-        top_mem = top5_memory_remote(sess)
-        top_io  = top5_disk_remote(sess, SAMPLE_SEC)
-
-        # Docker
-        docker_rows = docker_summary_remote(sess)
-
-        # Metrics
-        metrics = {
-            "timestamp": utc_iso_now(),
-            "cpu_percent": cpu_now,
-            "disk_percent": disk_used,
-            "memory_percent": mem_used,
-            "disk_read_bytes": None,
-            "disk_write_bytes": None,
-            "cpu_count": None,
-            "memory_available_bytes": None,
-            "disk_free_bytes": None,
-            "top_cpu": top_cpu,
-            "top_mem": top_mem,
-            "top_io": top_io,
-        }
-
-        health = check_remote_health(metrics, cpu_t, disk_t, mem_t)
-
-        print("=" * 70)
-        print(" SkynetOps — Remote VM Health (SSH)")
-        print("=" * 70)
-        print(f"Host           : {VM_HOST}")
-        print(f"Timestamp (UTC): {metrics['timestamp']}")
-        print(f"CPU            : {metrics.get('cpu_percent', 0.0):.2f}%")
-        print(f"Memory Used    : {(metrics.get('memory_percent') if metrics.get('memory_percent') is not None else float('nan')):.2f}%")
-        print(f"Disk Used      : {(metrics.get('disk_percent') if metrics.get('disk_percent') is not None else float('nan')):.2f}%")
-        print(f"Status         : {'HEALTHY' if health['is_healthy'] else 'ALERT'}")
-        if health["alerts"]:
-            print("Alerts:")
-            for i, a in enumerate(health["alerts"], 1):
-                print(f"  {i}. {a}")
-        print("=" * 70)
-
-        # Send alert if needed
-        if not health["is_healthy"]:
-            process_health_alert(metrics, health, cpu_t, disk_t, mem_t, df, cpu_line, docker_rows)
-        else:
-            print(f"{ICONS['ok']} System is healthy - no alert sent.")
-
-# ---------------- Continuous loop ----------------
-def continuous_loop(cpu_t: float, disk_t: float, mem_t: float) -> None:
-    if not VM_HOST:
-        print("❌ VM_HOST not set in .env. Please configure SSH to Azure VM.")
-        return
-
-    print("Starting continuous monitoring loop (Remote Azure VM via SSH). Press Ctrl+C to stop.")
+    print("Starting continuous monitoring loop. Press Ctrl+C to stop.")
     while True:
         try:
-            with SSHSession() as sess:
-                cpu_now = sample_cpu_remote(sess, SAMPLE_SEC)
-                mem_used = mem_used_pct_remote(sess)
-                disk_used = disk_capacity_used_remote(sess, MOUNT_PATH)
+            rows = query_recent_metrics(FAST_LOOKBACK_MIN)
+            cpu_latest = None
+            mem_pct_free = None
 
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cpu_sev = classify_severity(cpu_now, cpu_t) if cpu_now > cpu_t else None
-                disk_sev = classify_severity(disk_used or 0.0, disk_t) if (disk_used is not None and disk_used > disk_t) else None
-                mem_sev  = classify_severity(mem_used or 0.0, mem_t) if (mem_used is not None and mem_used > mem_t) else None
-                overall  = overall_severity(cpu_sev, disk_sev, mem_sev) or ""
-                icon = f"[Alert {overall}]" if overall else "[OK]"
-                print(
-                    f"[{ts}] {icon} CPU={cpu_now:.1f}% "
-                    f"Disk={(disk_used if disk_used is not None else float('nan')):.1f}% "
-                    f"Mem={(mem_used if mem_used is not None else float('nan')):.1f}%"
-                )
+            if rows:
+                df = rows_to_df(rows)
+                if "Percentage CPU" in df["metric"].unique():
+                    cpu_latest = float(
+                        df.loc[df["metric"] == "Percentage CPU"]
+                        .sort_values("timestamp")["value"]
+                        .iloc[-1]
+                    )
 
-                health = check_remote_health(
-                    {"cpu_percent": cpu_now, "disk_percent": disk_used, "memory_percent": mem_used},
-                    cpu_t, disk_t, mem_t
-                )
+                ssh_cpu = ssh_get_overall_cpu()
+                if ssh_cpu is not None:
+                    cpu_latest = ssh_cpu
 
-                if not health["is_healthy"]:
-                    print("ALERT detected:", health["alerts"])
-                    # Micro-series
-                    rows: List[List] = []
-                    for _ in range(max(1, FAST_SAMPLES)):
-                        t = utc_iso_now()
-                        c = sample_cpu_remote(sess, SAMPLE_SEC)
-                        r, w = disk_bps_remote(sess, SAMPLE_SEC)
-                        rows += [[t, "Percentage CPU", c], [t, "Disk Read Bytes", r], [t, "Disk Write Bytes", w]]
-                    df = rows_to_df(rows)
-                    cpu_line = generate_line_chart(df, "Percentage CPU", f"vm_cpu_{int(time.time())}.png")
+                mem_total_bytes = TOTAL_MEMORY_BYTES if TOTAL_MEMORY_BYTES > 0 else None
+                if ("Available Memory Bytes" in df["metric"].unique()) and (mem_total_bytes is not None):
+                    mem_bytes = float(
+                        df.loc[df["metric"] == "Available Memory Bytes"]
+                        .sort_values("timestamp")["value"]
+                        .iloc[-1]
+                    )
+                    mem_pct_free = (mem_bytes / mem_total_bytes) * 100.0
+                else:
+                    ssh_total, ssh_available = ssh_get_memory_info()
+                    if ssh_total is not None and ssh_available is not None:
+                        mem_pct_free = (ssh_available / ssh_total) * 100.0
 
-                    # Top-5 + Docker
-                    top_cpu = top5_cpu_remote(sess)
-                    top_mem = top5_memory_remote(sess)
-                    top_io  = top5_disk_remote(sess, SAMPLE_SEC)
-                    docker_rows = docker_summary_remote(sess)
+                alert_reasons = []
+                if cpu_latest is not None and cpu_latest > CPU_THRESHOLD:
+                    alert_reasons.append("High CPU")
+                if mem_pct_free is not None and mem_pct_free < MEM_FREE_PCT_THRESHOLD:
+                    alert_reasons.append("Low memory")
 
-                    metrics_full = {
-                        "timestamp": utc_iso_now(),
-                        "cpu_percent": cpu_now,
-                        "disk_percent": disk_used,
-                        "memory_percent": mem_used,
-                        "disk_read_bytes": None,
-                        "disk_write_bytes": None,
-                        "cpu_count": None,
-                        "memory_available_bytes": None,
-                        "disk_free_bytes": None,
-                        "top_cpu": top_cpu,
-                        "top_mem": top_mem,
-                        "top_io": top_io,
-                    }
-                    process_health_alert(metrics_full, health, cpu_t, disk_t, mem_t, df, cpu_line, docker_rows)
+                if alert_reasons:
+                    print("ALERT detected:", alert_reasons)
+                    process_cycle(rows, agent_client)
+                else:
+                    print(f"No alert: CPU={cpu_latest} Mem%Free={mem_pct_free}")
+            else:
+                print("No metrics returned this cycle.")
 
             time.sleep(30)
         except KeyboardInterrupt:
@@ -1476,16 +1564,12 @@ def continuous_loop(cpu_t: float, disk_t: float, mem_t: float) -> None:
             print("Loop error:", e)
             time.sleep(10)
 
-# ---------------- CLI / Main ----------------
 if __name__ == "__main__":
     if "--test-email" in sys.argv:
-        ok = send_email_with_html("[SkynetOps TEST] SMTP Check", "<html><body><p>SkynetOps TEST email</p></body></html>", [], cid_images=[])
+        ok = test_email_only()
         print("Test email result:", ok)
-        sys.exit(0)
-
-    cpu_thr, disk_thr, mem_thr = get_thresholds_from_user()
-
-    if "--check" in sys.argv:
-        one_time_check(cpu_thr, disk_thr, mem_thr)
+    elif "--test-dummy" in sys.argv:
+        ok = test_dummy_once()
+        print("Dummy test run result:", ok)
     else:
-        continuous_loop(cpu_thr, disk_thr, mem_thr)
+        continuous_loop()

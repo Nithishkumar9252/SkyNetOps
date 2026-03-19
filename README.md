@@ -14,38 +14,7 @@
 	
 **Architecture Overview**
 
-	flowchart TD
-	
-	%% Main Monitoring Flow
-	A[Azure Monitor] -->|Threshold breach triggers automated event ingestion| B[Azure Functions]
-	
-	%% Workload Monitoring Path
-	subgraph Workloads
-	W1[VM]
-	W2[Storage Account]
-	W3[WebApp]
-	end
-	
-	W1 --> A
-	W2 --> A
-	W3 --> A
-	
-	A -->|Workload health & availability monitored continuously| A
-	
-	%% Azure Functions to ServiceNow
-	B -->|AI‑enriched data with root cause and recommended actions| SN[ServiceNow]
-	SN -->|Incident auto‑created with AI‑generated insights| SN
-	
-	%% Azure Functions to SMTP
-	B -->|AI‑enriched email sent to Ops Team| SMTP[SMTP]
-	SMTP --> OPS[Operations Team]
-	
-	%% Azure Functions to Azure AI Foundry
-	B -->|Analyzes alert data: root cause, impact, recovery recommendations| AI[Azure AI Foundry]
-	AI -->|Recovery confirmed| B
-	
-	%% Final operations step
-	OPS -->|Operations team resolves the issue using AI‑recommended steps| END(( ))
+	Workloads → Azure Monitor → Azure Functions → Azure AI Foundry → Azure Functions → ServiceNow → SMTP → Operations Team
 
   
 **Setup:**

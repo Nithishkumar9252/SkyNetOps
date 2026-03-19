@@ -13,6 +13,7 @@
 	•	Forecasting & anomaly detection
 	
 **Architecture Overview**
+
 	flowchart TD
 	
 	%% Main Monitoring Flow

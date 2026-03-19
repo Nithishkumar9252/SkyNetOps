@@ -1,6 +1,6 @@
 🚀 **SkynetOps — Azure VM Monitoring**
 
-SkynetOps is an advanced SRE automation tool that monitors Azure Virtual Machines in real-time, detects anomalies, generates AI-powered incident reports, and integrates with Email Alerts + ServiceNow for full incident lifecycle management.
+**SkynetOps** is an advanced SRE automation tool that monitors Azure Virtual Machines in real-time, detects anomalies, generates AI-powered incident reports, and integrates with Email Alerts + ServiceNow for full incident lifecycle management.
 
 **Features**
 
@@ -11,18 +11,19 @@ SkynetOps is an advanced SRE automation tool that monitors Azure Virtual Machine
 	•	ServiceNow ticket automation
 	•	Recovery detection (adds work notes)
 	•	Forecasting & anomaly detection
-
+	
 **Architecture Overview**
 
-Azure Monitor → SkynetOps Engine → AI Analysis
-        ↓                     ↓
-   Metrics Fetch        Forecast Engine
-        ↓                     ↓
-   Threshold Check → Incident Creation
-        ↓                     ↓
-   Email Alerts      ServiceNow Tickets
+	Azure Monitor → SkynetOps Engine → AI Analysis
+	        ↓                     ↓
+	   Metrics Fetch        Forecast Engine
+	        ↓                     ↓
+	   Threshold Check → Incident Creation
+	        ↓                     ↓
+	   Email Alerts      ServiceNow Tickets
 
 **Setup:**
+
 	1.	Install dependencies:
         pip install -r requirements.txt
     2.	Configure secrets in Azure Key Vault:
@@ -54,18 +55,18 @@ Azure Monitor → SkynetOps Engine → AI Analysis
 
 **AI Incident Report Example:**
 
-SRE Incident Report
-
-Summary:
-- CPU Current: 92%
-- CPU Avg: 75%
-- Disk Activity: High
-
-Root Cause:
-- High load due to background jobs
-- Disk contention
-
-Immediate Actions:
-1. Restart high CPU process
-2. Check cron jobs
-3. Scale VM if needed
+	SRE Incident Report
+	
+	Summary:
+	- CPU Current: 92%
+	- CPU Avg: 75%
+	- Disk Activity: High
+	
+	Root Cause:
+	- High load due to background jobs
+	- Disk contention
+	
+	Immediate Actions:
+	1. Restart high CPU process
+	2. Check cron jobs
+	3. Scale VM if needed

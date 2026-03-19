@@ -1,8 +1,8 @@
-🚀 SkynetOps — Azure VM Monitoring
+🚀 **SkynetOps — Azure VM Monitoring**
 
-SkynetOps is an SRE automation tool that monitors Azure VMs, detects issues, generates AI-based incident reports, and creates alerts via Email + ServiceNow.
 SkynetOps is an advanced SRE automation tool that monitors Azure Virtual Machines in real-time, detects anomalies, generates AI-powered incident reports, and integrates with Email Alerts + ServiceNow for full incident lifecycle management.
-Features
+
+**Features**
 	•	Monitor CPU, Memory, Disk
 	•	Auto alerts on threshold breach
 	•	AI-powered incident analysis
@@ -10,7 +10,9 @@ Features
 	•	ServiceNow ticket automation
 	•	Recovery detection (adds work notes)
 	•	Forecasting & anomaly detection
-🏗️ Architecture Overview
+
+**Architecture Overview**
+
 Azure Monitor → SkynetOps Engine → AI Analysis
         ↓                     ↓
    Metrics Fetch        Forecast Engine
@@ -19,7 +21,7 @@ Azure Monitor → SkynetOps Engine → AI Analysis
         ↓                     ↓
    Email Alerts      ServiceNow Tickets
 
-Setup
+**Setup:**
 	1.	Install dependencies:
         pip install -r requirements.txt
     2.	Configure secrets in Azure Key Vault:
@@ -27,24 +29,24 @@ Setup
 		. CPU / Memory / Disk thresholds
 	3.	(Optional) Add vms.json for multiple VMs + SSH
 
-Run:
+**Run:**
     python skynetops.py
-Parallel mode:
+**Parallel mode:**
     python skynetops.py --parallel
 
-Alerts
+**Alerts**
 	•	High CPU / Memory / Disk → Incident created
 	•	VM Down → P1
 	•	Telemetry Missing → P2
 	•	Recovery → Email + note (no auto close)
 
-📎 Attachments Generated
-	•	📄 CSV (metrics + context)
-	•	📈 Charts (CPU, Memory, Disk)
-	•	🤖 AI analysis report
-	•	🔍 Top processes (via SSH)
+**Attachments Generated**
+	•	CSV (metrics + context)
+	•	Charts (CPU, Memory, Disk)
+	•	AI analysis report
+	•	Top processes (via SSH)
 
-🧠 AI Incident Report Example
+**AI Incident Report Example:**
 SRE Incident Report
 
 Summary:

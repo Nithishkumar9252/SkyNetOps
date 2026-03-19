@@ -22,6 +22,95 @@
 	        ↓                     ↓
 	   Email Alerts      ServiceNow Tickets
 
+                  ┌──────────────────────────────┐
+                  │        Azure Platform        │
+                  │  (VMs, Extensions, Agents)  │
+                  └─────────────┬────────────────┘
+                                │
+                                ▼
+                  ┌──────────────────────────────┐
+                  │     Azure Monitor Layer      │
+                  │ Metrics | Logs | Activity    │
+                  └─────────────┬────────────────┘
+                                │
+                                ▼
+         ┌─────────────────────────────────────────────┐
+         │           Data Ingestion Layer              │
+         │  - Metrics API                             │
+         │  - Logs Query API                          │
+         │  - Resource Health API                     │
+         └─────────────┬──────────────────────────────┘
+                       │
+                       ▼
+     ┌────────────────────────────────────────────────────┐
+     │              SkynetOps Processing Core             │
+     │                                                    │
+     │  ┌──────────────┐   ┌──────────────┐               │
+     │  │ State Engine │   │ Config Layer │               │
+     │  │ (sn_state)   │   │ (Key Vault)  │               │
+     │  └──────┬───────┘   └──────┬───────┘               │
+     │         │                  │                       │
+     │         ▼                  ▼                       │
+     │  ┌─────────────────────────────────────────────┐  │
+     │  │         Detection & Decision Engine         │  │
+     │  │ - Threshold evaluation                      │  │
+     │  │ - Telemetry gap detection                  │  │
+     │  │ - VM crash detection                       │  │
+     │  │ - Severity classification (P1/P2/P3)       │  │
+     │  └──────────────┬──────────────────────────────┘  │
+     │                 │                                 │
+     │                 ▼                                 │
+     │  ┌─────────────────────────────────────────────┐  │
+     │  │          Analytics & Intelligence Layer     │  │
+     │  │ - Forecast Engine (ARIMA/HW/Linear)         │  │
+     │  │ - Anomaly Detection (Z-score)               │  │
+     │  │ - Pattern recognition                      │  │
+     │  └──────────────┬──────────────────────────────┘  │
+     │                 │                                 │
+     │                 ▼                                 │
+     │  ┌─────────────────────────────────────────────┐  │
+     │  │           AI Reasoning Layer                │  │
+     │  │ - Azure AI Agents                          │  │
+     │  │ - Root cause analysis                      │  │
+     │  │ - Runbook generation                       │  │
+     │  │ - Incident summarization                   │  │
+     │  └──────────────┬──────────────────────────────┘  │
+     │                 │                                 │
+     │                 ▼                                 │
+     │  ┌─────────────────────────────────────────────┐  │
+     │  │         Enrichment Layer (Optional)         │  │
+     │  │ - SSH diagnostics (paramiko)               │  │
+     │  │ - Process-level insights                  │  │
+     │  │ - Disk I/O breakdown                      │  │
+     │  └──────────────┬──────────────────────────────┘  │
+     │                 │                                 │
+     │                 ▼                                 │
+     │  ┌─────────────────────────────────────────────┐  │
+     │  │        Incident Orchestration Layer         │  │
+     │  │ - Deduplication logic                      │  │
+     │  │ - Incident lifecycle mgmt                  │  │
+     │  │ - Recovery handling                        │  │
+     │  └──────────────┬──────────────────────────────┘  │
+     └────────────────┼─────────────────────────────────┘
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+┌────────────────────┐   ┌────────────────────┐
+│ Notification Layer │   │ ITSM Integration   │
+│ (Email Engine)     │   │ (ServiceNow API)   │
+│ - HTML alerts      │   │ - Incident create  │
+│ - Charts           │   │ - Work notes       │
+│ - AI report        │   │ - State sync       │
+└────────────────────┘   └────────────────────┘
+                      │
+                      ▼
+              ┌──────────────┐
+              │ Recovery Loop │
+              │ - Detect fix  │
+              │ - Notify      │
+              │ - Add notes   │
+              └──────────────┘
+
 **Setup:**
 
 	1.	Install dependencies:

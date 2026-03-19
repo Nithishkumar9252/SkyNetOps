@@ -13,104 +13,40 @@
 	•	Forecasting & anomaly detection
 	
 **Architecture Overview**
+	flowchart TD
+	
+	%% Main Monitoring Flow
+	A[Azure Monitor] -->|Threshold breach triggers automated event ingestion| B[Azure Functions]
+	
+	%% Workload Monitoring Path
+	subgraph Workloads
+	W1[VM]
+	W2[Storage Account]
+	W3[WebApp]
+	end
+	
+	W1 --> A
+	W2 --> A
+	W3 --> A
+	
+	A -->|Workload health & availability monitored continuously| A
+	
+	%% Azure Functions to ServiceNow
+	B -->|AI‑enriched data with root cause and recommended actions| SN[ServiceNow]
+	SN -->|Incident auto‑created with AI‑generated insights| SN
+	
+	%% Azure Functions to SMTP
+	B -->|AI‑enriched email sent to Ops Team| SMTP[SMTP]
+	SMTP --> OPS[Operations Team]
+	
+	%% Azure Functions to Azure AI Foundry
+	B -->|Analyzes alert data: root cause, impact, recovery recommendations| AI[Azure AI Foundry]
+	AI -->|Recovery confirmed| B
+	
+	%% Final operations step
+	OPS -->|Operations team resolves the issue using AI‑recommended steps| END(( ))
 
-	Azure Monitor → SkynetOps Engine → AI Analysis
-	        ↓                     ↓
-	   Metrics Fetch        Forecast Engine
-	        ↓                     ↓
-	   Threshold Check → Incident Creation
-	        ↓                     ↓
-	   Email Alerts      ServiceNow Tickets
-
-                  ┌──────────────────────────────┐
-                  │        Azure Platform        │
-                  │  (VMs, Extensions, Agents)  │
-                  └─────────────┬────────────────┘
-                                │
-                                ▼
-                  ┌──────────────────────────────┐
-                  │     Azure Monitor Layer      │
-                  │ Metrics | Logs | Activity    │
-                  └─────────────┬────────────────┘
-                                │
-                                ▼
-         ┌─────────────────────────────────────────────┐
-         │           Data Ingestion Layer              │
-         │  - Metrics API                             │
-         │  - Logs Query API                          │
-         │  - Resource Health API                     │
-         └─────────────┬──────────────────────────────┘
-                       │
-                       ▼
-     ┌────────────────────────────────────────────────────┐
-     │              SkynetOps Processing Core             │
-     │                                                    │
-     │  ┌──────────────┐   ┌──────────────┐               │
-     │  │ State Engine │   │ Config Layer │               │
-     │  │ (sn_state)   │   │ (Key Vault)  │               │
-     │  └──────┬───────┘   └──────┬───────┘               │
-     │         │                  │                       │
-     │         ▼                  ▼                       │
-     │  ┌─────────────────────────────────────────────┐  │
-     │  │         Detection & Decision Engine         │  │
-     │  │ - Threshold evaluation                      │  │
-     │  │ - Telemetry gap detection                  │  │
-     │  │ - VM crash detection                       │  │
-     │  │ - Severity classification (P1/P2/P3)       │  │
-     │  └──────────────┬──────────────────────────────┘  │
-     │                 │                                 │
-     │                 ▼                                 │
-     │  ┌─────────────────────────────────────────────┐  │
-     │  │          Analytics & Intelligence Layer     │  │
-     │  │ - Forecast Engine (ARIMA/HW/Linear)         │  │
-     │  │ - Anomaly Detection (Z-score)               │  │
-     │  │ - Pattern recognition                      │  │
-     │  └──────────────┬──────────────────────────────┘  │
-     │                 │                                 │
-     │                 ▼                                 │
-     │  ┌─────────────────────────────────────────────┐  │
-     │  │           AI Reasoning Layer                │  │
-     │  │ - Azure AI Agents                          │  │
-     │  │ - Root cause analysis                      │  │
-     │  │ - Runbook generation                       │  │
-     │  │ - Incident summarization                   │  │
-     │  └──────────────┬──────────────────────────────┘  │
-     │                 │                                 │
-     │                 ▼                                 │
-     │  ┌─────────────────────────────────────────────┐  │
-     │  │         Enrichment Layer (Optional)         │  │
-     │  │ - SSH diagnostics (paramiko)               │  │
-     │  │ - Process-level insights                  │  │
-     │  │ - Disk I/O breakdown                      │  │
-     │  └──────────────┬──────────────────────────────┘  │
-     │                 │                                 │
-     │                 ▼                                 │
-     │  ┌─────────────────────────────────────────────┐  │
-     │  │        Incident Orchestration Layer         │  │
-     │  │ - Deduplication logic                      │  │
-     │  │ - Incident lifecycle mgmt                  │  │
-     │  │ - Recovery handling                        │  │
-     │  └──────────────┬──────────────────────────────┘  │
-     └────────────────┼─────────────────────────────────┘
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-┌────────────────────┐   ┌────────────────────┐
-│ Notification Layer │   │ ITSM Integration   │
-│ (Email Engine)     │   │ (ServiceNow API)   │
-│ - HTML alerts      │   │ - Incident create  │
-│ - Charts           │   │ - Work notes       │
-│ - AI report        │   │ - State sync       │
-└────────────────────┘   └────────────────────┘
-                      │
-                      ▼
-              ┌──────────────┐
-              │ Recovery Loop │
-              │ - Detect fix  │
-              │ - Notify      │
-              │ - Add notes   │
-              └──────────────┘
-
+  
 **Setup:**
 
 	1.	Install dependencies:
